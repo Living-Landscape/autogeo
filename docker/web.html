@@ -1,0 +1,384 @@
+<!doctype html>
+<html>
+<head>
+	<meta name=viewport content="initial-scale=1">
+	<title>Císařské otisky</title>
+	<link rel="shortcut icon" type="image/png" href="icon.png"/>
+	<style>
+		body {text-align:center;overflow-x:hidden;}
+		label {cursor:pointer;background-color:#4CAF50;color:white;padding:0.5em 1em;border-radius:0.3em;}
+		img {width:100%;height:auto;max-width:759px;}
+		form {display:none;}
+		aside {color:gray;padding:3em 1em 1em 1em;}
+		th {padding: 0.1em 1em;text-align:right;font-family:sans-serif;color:#07c;text-overflow:ellipsis;overflow:hidden;max-width:20em;width:50%;white-space:nowrap;}
+		td {padding: 0.1em 1em;text-align:left;text-overflow:ellipsis;overflow:hidden;white-space:nowrap;}
+		#upload {opacity:0;position: absolute;z-index:-1;}
+		#message {color:red;padding: 1em 0;display:none;}
+		#nojs {color:red;padding: 1em 0;}
+		#workspace {margin:0 auto;display:none;}
+		#workspace-wrap {overflow-x:auto;}
+		.download {background-color:#4CAF50;color:white;padding:0.1em 0.3em;border-radius:0.3em;text-decoration:none;}
+		.details {padding:0.1em 0.3em;border-radius:0.3em;cursor:help;}
+		.error {background-color:#c22;color:white;}
+		.info {background-color:#e60;color:white;}
+	</style>
+</head>
+<body>
+	<article>
+	<h1>Císařské otisky</h1>
+	<p><img alt="" width=759 height=272 src="preview.png"></p>
+	<p>Po vložení obrázků císařských otisků se ti vrátí obrázky map, které se lépe georeferencují.</p>
+	<form url=/upload method=post enctype=multipart/form-data>
+		<label for=upload>Nahraj mapu</label>
+		<input type=file id=upload name=upload multiple>
+		<input type=submit value="Zpracuj">
+	</form>
+	<noscript><div id=nojs>Pro běh téhle aplikace potřebuje mít javascript zapnutý.</div></noscript>
+	<div id=message></div>
+	<div id=workspace-wrap><table id=workspace></table></div>
+	</article>
+	<aside>V případě potíží dej vědět na cio@nejaky-mail.cz</aside>
+	<script>
+		/* validate image sizes */
+		function validateImage(file, callbackOk, callbackError) {
+			const reader = new FileReader()
+
+			if(file.size > 20 * 1024 * 1024) {
+				callbackError('Maxiální velikost souboru je 20MB.')
+				return
+			}
+
+			reader.addEventListener('load', (event) => {
+				const image = new Image();
+
+				image.addEventListener('load', (event) => {
+					const width = event.target.width
+					const height = event.target.height
+
+					if(width < 100 || height < 100) {
+						callbackError('Minimální velikost obrázku je 100x100.')
+					} else if(width > 10000 || height > 10000) {
+						callbackError('Maximální velikost obrázku je 10000x10000.')
+					} else {
+						callbackOk()
+					}
+				})
+				image.addEventListener('error', () => callbackError('Obrázek musí být ve formátu .png nebo .jpg'))
+				image.src = event.target.result;
+			})
+			reader.addEventListener('error', () => callbackError('Nemůžu přečíst soubor.'))
+			reader.readAsDataURL(file)
+		}
+
+		/* parse status check */
+		function parseCheckResult(checkResult) {
+			if('error' in checkResult) {
+				return {
+					message: 'chyba při zpracování',
+					details: checkResult.error,
+					finished: true,
+					download: false,
+					error: true
+				}
+			} else {
+				if(checkResult.status == 'queued') {
+					return {
+						message: `ve frontě na zpracování, pořadí ${checkResult.position}`,
+						details: checkResult.info,
+						jobId: checkResult.jobId,
+						finished: false,
+						download: false,
+						error: false
+					}
+				} else if(checkResult.status == 'started') {
+					return {
+						message: 'zpracová se',
+						details: checkResult.info,
+						finished: false,
+						download: false,
+						error: false
+					}
+				} else if(checkResult.status == 'finished') {
+					return {
+						message: 'hotovo',
+						details: checkResult.info,
+						finished: true,
+						download: checkResult.download === true,
+						error: false
+					}
+				} else if(checkResult.status == 'canceled') {
+					return {
+						message: 'zrušeno',
+						details: checkResult.info,
+						finished: true,
+						download: false,
+						error: true
+					}
+				} else {
+					return {
+						message: 'chyba aplikace',
+						details: checkResult.error,
+						finished: true,
+						download: false,
+						error: true
+					}
+				}
+			}
+		}
+
+		/* create info box with message */
+		function detailsBox(message) {
+				const details = document.createElement('span')
+
+				details.classList.add('details')
+				details.textContent = 'info'
+				details.setAttribute('title', message)
+				details.setAttribute('tabindex', '0')
+
+				return details
+		}
+
+		/* check processing status */
+		function checkStatus(jobs) {
+			const xhttp = new XMLHttpRequest()
+
+			// clear check timeout
+			jobs.checkTimeout = null
+
+			// create and send check status request
+			xhttp.addEventListener('load', (event) => {
+				let parsedResponse
+				let responseError
+
+				// try to parse response
+				try {
+					parsedResponse = JSON.parse(event.target.response)
+					if('error' in parsedResponse) {
+						responseError = true
+					}
+				} catch(error) {
+					responseError = true
+				}
+
+				// keep checking in case of an error
+				if(responseError === true) {
+					if(Object.keys(jobs.jobIds).length> 0 && jobs.checkTimeout === null) {
+						jobs.checkTimeout = setTimeout(() => checkStatus(jobs), 5000)
+					}
+					return
+				}
+
+				// iterate through job ids
+				for(const [jobId, checkResult] of Object.entries(parsedResponse)) {
+					const parsed = parseCheckResult(checkResult)
+					const job = jobs.jobIds[jobId]
+
+					job.uiStatus.textContent = parsed.message
+
+					// add details ui
+					if(parsed.details !== undefined) {
+						const details = detailsBox(parsed.details)
+
+						if(parsed.error) {
+							details.classList.add('error')
+						} else {
+							details.classList.add('info')
+						}
+						job.uiStatus.append(document.createTextNode('\u00A0'))
+						job.uiStatus.append(details)
+					}
+
+					if(parsed.finished) {
+						// finished, add download ui
+						if(parsed.download) {
+							job.uiStatus.append(document.createTextNode('\u00A0'))
+							job.uiStatus.append(job.uiDownload)
+							job.uiDownload.addEventListener('click', (event) => {
+								const link = document.createElement('a')
+
+								event.preventDefault()
+
+								// virtual download link
+								link.setAttribute('href', `download?id=${encodeURIComponent(job.jobId)}`)
+								link.style.display = 'none'
+								document.body.append(link)
+								link.click()
+								document.body.removeChild(link)
+							})
+						}
+
+						delete jobs.jobIds[jobId]
+					}
+				}
+
+				// check if processing is finished
+				if(Object.keys(jobs.jobIds).length> 0 && jobs.checkTimeout === null) {
+					jobs.checkTimeout = setTimeout(() => checkStatus(jobs), 2000)
+				}
+			}, false)
+			xhttp.open('GET', `status?ids=${encodeURIComponent(Object.keys(jobs.jobIds).join(','))}`)
+			xhttp.send()
+		}
+
+		/* upload complete callback */
+		function uploadComplete(event, job, jobs) {
+			let parsedResponse
+
+			// try to parse resonse
+			try {
+				parsedResponse = JSON.parse(event.target.response)
+			} catch {
+				job.uiStatus.textContent = 'chyba při komunikaci se serverem'
+				setTimeout(() => uploadQueue(jobs), 1)
+				return
+			}
+
+			parsed = parseCheckResult(parsedResponse)
+			job.uiStatus.textContent = parsed.message
+			if(parsed.details !== undefined) {
+				const details = detailsBox(parsed.details)
+
+				if(parsed.error) {
+					details.classList.add('error')
+				}
+				jobs.uiStatus.append(document.createTextNode('\u00A0'))
+				jobs.uiStatus.append(details)
+			}
+
+			if(!parsed.error) {
+				job.jobId = parsed.jobId
+				jobs.jobIds[job.jobId] = job
+				delete job.file
+
+				if(jobs.checkTimeout === null) {
+					jobs.checkTimeout = setTimeout(() => checkStatus(jobs), 1000)
+				}
+			}
+			setTimeout(() => uploadQueue(jobs), 1)
+		}
+
+		/* upload error callback */
+		function uploadError(event, job, jobs) {
+			job.uiStatus.textContent = 'nepodařilo se soubor nahrát'
+			setTimeout(() => uploadQueue(processing), 1)
+		}
+
+		/* upload abort callback */
+		function uploadAbort(event, job, jobs) {
+			job.uiStatus.textContent = 'nahrávání zrušeno'
+			setTimeout(() => uploadQueue(processing), 1)
+		}
+
+		/* upload progress callback */
+		function uploadProgress(event, job) {
+			const percent = Math.round((event.loaded / event.total) * 100);
+
+			job.uiStatus.textContent = `nahrávám, ${percent}%`
+		}
+
+		/* pick file from queue and process it */
+		function uploadQueue(jobs) {
+			if(jobs.queue.length == 0) {
+				return
+			}
+
+			// get queue job
+			job = jobs.queue.shift()
+
+			validateImage(
+				job.file,
+				() => {
+					// send job
+					const xhttp = new XMLHttpRequest()
+					const formData = new FormData()
+
+					formData.append('upload', job.file)
+					xhttp.addEventListener('load', (event) => uploadComplete(event, job, jobs), false)
+					xhttp.addEventListener('error', (event) => uploadError(event, job, jobs), false)
+					xhttp.addEventListener('abort', (event) => uploadAbort(event, job, jobs), false)
+					xhttp.upload.addEventListener('progress', (event) => uploadProgress(event, job), false)
+					xhttp.open('POST', 'upload')
+					xhttp.send(formData)
+				},
+				(error) => {
+					// show error
+					const details = detailsBox(error)
+
+					job.uiStatus.textContent = 'chyba při zpracování'
+					details.classList.add('error')
+					job.uiStatus.append(document.createTextNode('\u00A0'))
+					job.uiStatus.append(details)
+					setTimeout(() => uploadQueue(jobs), 1)
+				}
+			)
+		}
+
+		/* submit form with chosen files */
+		function submit() {
+			const uiMessage = document.querySelector('#message')
+			const uiWorkspace = document.querySelector('#workspace')
+			const files = document.querySelector('#upload').files
+			const maxFiles = 10
+
+			message.textContent = ''
+			message.style.display = 'none'
+
+			if(files.length > maxFiles ) {
+				message.textContent = `Maximální počet souborů, které můžeš nahrát najednou je ${maxFiles}.`
+				message.style.display = 'block'
+			} else {
+				const jobs = {
+					queue: [],
+					jobIds: [],
+					checkTimeout: null
+				}
+
+				document.querySelector('form').style.display = 'none'
+				document.querySelector('#workspace').style.display = 'table'
+
+				// build result ui
+				for(const file of files) {
+					const uiRow = document.createElement('tr')
+					const uiName = document.createElement('th')
+					const uiStatus = document.createElement('td')
+					const uiDownload = document.createElement('a')
+					const job = {}
+
+					uiName.textContent = file.name
+					uiStatus.textContent = 'čekám na nahrávání'
+					uiDownload.classList.add('download')
+					uiDownload.textContent = 'stáhnout'
+					uiDownload.setAttribute('href', '#')
+					uiRow.append(uiName)
+					uiRow.append(uiStatus)
+					uiWorkspace.append(uiRow)
+
+					job.uiStatus = uiStatus
+					job.uiDownload = uiDownload
+					job.file = file
+					jobs.queue.push(job)
+				}
+
+				// start uploading
+				uploadQueue(jobs)
+			}
+		}
+
+		/* attach ui listeners */
+		function init() {
+			document.querySelector('form').style.display = 'block';
+
+			document.querySelector('input[type=submit]').style.display = 'none'
+			document.querySelector('#upload').addEventListener('change', event => {
+				submit()
+			})
+			document.querySelector('form').addEventListener('submit', event => {
+				event.preventDefault()
+				submit()
+			})
+		}
+
+		init()
+	</script>
+</body>
+</html>
