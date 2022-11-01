@@ -11,6 +11,7 @@ Project aims to automatically georeference "Císařské otisky" from https://ags
  * `autogeo` web service runs in docker container
  * `./prepare-web.sh` - prepare necessary files in `web` folder
  * `cd web && ./run.sh` - run production version of `autogeo` web service
+ * `autogeo` web service runs inside docker on port 17859
 
 ## Development
  * `segmentation.{py,ipynb}` - script / notebook for automatic map foreground extraction

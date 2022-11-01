@@ -300,7 +300,7 @@ if __name__ == '__main__':
         web_template = web_file.read()
 
     # serve flask application
-    host = '127.0.0.1'
+    host = '0.0.0.0'
     port = 17859
     logger.info('serving on %s:%s', host, port)
     waitress.serve(app, host=host, port=port)
