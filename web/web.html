@@ -8,16 +8,19 @@
 		body {text-align:center;overflow-x:hidden;}
 		label {cursor:pointer;background-color:#4CAF50;color:white;padding:0.5em 1em;border-radius:0.3em;}
 		img {width:100%;height:auto;max-width:759px;}
-		form {display:none;}
-		aside {color:gray;padding:3em 1em 1em 1em;}
+		form {display:none;padding:0.5em 1em;margin:1em;}
+		p {margin:1em;}
+		aside {color:gray;margin:2em 1em 1em 1em;}
 		th {padding: 0.1em 1em;text-align:right;font-family:sans-serif;color:#07c;text-overflow:ellipsis;overflow:hidden;max-width:20em;width:50%;white-space:nowrap;}
 		td {padding: 0.1em 1em;text-align:left;text-overflow:ellipsis;overflow:hidden;white-space:nowrap;}
 		#upload {opacity:0;position: absolute;z-index:-1;}
-		#message {color:red;padding: 1em 0;display:none;}
+		#message {color:red;margin: 1em;}
 		#nojs {color:red;padding: 1em 0;}
 		#workspace {margin:0 auto;display:none;}
-		#workspace-wrap {overflow-x:auto;}
+		#workspace-wrap {overflow-x:auto;margin: 1em;}
 		.download {background-color:#4CAF50;color:white;padding:0.1em 0.3em;border-radius:0.3em;text-decoration:none;}
+		.tick {padding:0.1em 0.4em;}
+		.tick svg {width:0.8em;height:0.8em;}
 		.details {padding:0.1em 0.3em;border-radius:0.3em;cursor:help;}
 		.error {background-color:#c22;color:white;}
 		.info {background-color:#e60;color:white;}
@@ -27,7 +30,8 @@
 	<article>
 	<h1>Císařské otisky</h1>
 	<p><img alt="" width=759 height=272 src="preview.png"></p>
-	<p>Po vložení obrázků císařských otisků se ti vrátí obrázky map, které se lépe georeferencují.</p>
+	<p>Po vložení obrázků císařských otisků se ti vrátí ořízlé obrázky map, které se lépe georeferencují.</p>
+	<div id=workspace-wrap><table id=workspace></table></div>
 	<form url=/upload method=post enctype=multipart/form-data>
 		<label for=upload>Nahraj mapu</label>
 		<input type=file id=upload name=upload multiple>
@@ -35,16 +39,15 @@
 	</form>
 	<noscript><div id=nojs>Pro běh téhle aplikace potřebuje mít javascript zapnutý.</div></noscript>
 	<div id=message></div>
-	<div id=workspace-wrap><table id=workspace></table></div>
 	</article>
-	<aside>V případě potíží dej vědět na slack @Honza Procházka</aside>
+	<aside>V případě dotazů, námětů dej vědět na slack #maps-livinglandscape-cz</aside>
 	<script>
 		/* validate image sizes */
-		function validateImage(file, callbackOk, callbackError) {
+		function validateJob(job, callbackOk, callbackError) {
 			const reader = new FileReader()
 
-			if(file.size > 20 * 1024 * 1024) {
-				callbackError('Maxiální velikost souboru je 20MB.')
+			if(job.file.size > 20 * 1024 * 1024) {
+				callbackError(job, 'Maxiální velikost souboru je 20MB.')
 				return
 			}
 
@@ -56,18 +59,18 @@
 					const height = event.target.height
 
 					if(width < 100 || height < 100) {
-						callbackError('Minimální velikost obrázku je 100x100.')
+						callbackError(job, 'Minimální velikost obrázku je 100x100.')
 					} else if(width > 10000 || height > 10000) {
-						callbackError('Maximální velikost obrázku je 10000x10000.')
+						callbackError(job, 'Maximální velikost obrázku je 10000x10000.')
 					} else {
-						callbackOk()
+						callbackOk(job)
 					}
 				})
-				image.addEventListener('error', () => callbackError('Obrázek musí být ve formátu .png nebo .jpg'))
+				image.addEventListener('error', () => callbackError(job, 'Obrázek musí být ve formátu .png nebo .jpg'))
 				image.src = event.target.result;
 			})
-			reader.addEventListener('error', () => callbackError('Nemůžu přečíst soubor.'))
-			reader.readAsDataURL(file)
+			reader.addEventListener('error', () => callbackError(job, 'Nemůžu přečíst soubor.'))
+			reader.readAsDataURL(job.file)
 		}
 
 		/* parse status check */
@@ -143,7 +146,7 @@
 			const xhttp = new XMLHttpRequest()
 
 			// clear check timeout
-			jobs.checkTimeout = null
+			jobs.checkTimer = null
 
 			// create and send check status request
 			xhttp.addEventListener('load', (event) => {
@@ -162,8 +165,8 @@
 
 				// keep checking in case of an error
 				if(responseError === true) {
-					if(Object.keys(jobs.jobIds).length> 0 && jobs.checkTimeout === null) {
-						jobs.checkTimeout = setTimeout(() => checkStatus(jobs), 5000)
+					if(Object.keys(jobs.jobIds).length> 0 && jobs.checkTimer === null) {
+						jobs.checkTimer = setTimeout(() => checkStatus(jobs), 5000)
 					}
 					return
 				}
@@ -204,6 +207,14 @@
 								document.body.append(link)
 								link.click()
 								document.body.removeChild(link)
+
+								// downloaded tick
+								if(job.uiTick === undefined) {
+									job.uiTick = document.createElement('span')
+									job.uiTick.classList.add('tick')
+									job.uiTick.innerHTML = imageTick
+									job.uiStatus.append(job.uiTick)
+								}
 							})
 						}
 
@@ -212,12 +223,13 @@
 				}
 
 				// check if processing is finished
-				if(Object.keys(jobs.jobIds).length> 0 && jobs.checkTimeout === null) {
-					jobs.checkTimeout = setTimeout(() => checkStatus(jobs), 2000)
+				if(Object.keys(jobs.jobIds).length> 0 && jobs.checkTimer === null) {
+					jobs.checkTimer = setTimeout(() => checkStatus(jobs), 1000)
 				}
 			}, false)
-			xhttp.open('GET', `status?ids=${encodeURIComponent(Object.keys(jobs.jobIds).join(','))}`)
-			xhttp.send()
+			xhttp.open('POST', 'status')
+			xhttp.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded')
+			xhttp.send(`ids=${encodeURIComponent(Object.keys(jobs.jobIds).join(','))}`)
 		}
 
 		/* upload complete callback */
@@ -250,8 +262,8 @@
 				jobs.jobIds[job.jobId] = job
 				delete job.file
 
-				if(jobs.checkTimeout === null) {
-					jobs.checkTimeout = setTimeout(() => checkStatus(jobs), 1000)
+				if(jobs.checkTimer === null) {
+					jobs.checkTimer = setTimeout(() => checkStatus(jobs), 2000)
 				}
 			}
 			setTimeout(() => uploadQueue(jobs), 1)
@@ -260,13 +272,13 @@
 		/* upload error callback */
 		function uploadError(event, job, jobs) {
 			job.uiStatus.textContent = 'nepodařilo se soubor nahrát'
-			setTimeout(() => uploadQueue(processing), 1)
+			setTimeout(() => uploadQueue(jobs), 1)
 		}
 
 		/* upload abort callback */
 		function uploadAbort(event, job, jobs) {
 			job.uiStatus.textContent = 'nahrávání zrušeno'
-			setTimeout(() => uploadQueue(processing), 1)
+			setTimeout(() => uploadQueue(jobs), 1)
 		}
 
 		/* upload progress callback */
@@ -278,29 +290,42 @@
 
 		/* pick file from queue and process it */
 		function uploadQueue(jobs) {
+			// unregister timer
+			jobs.queueTimer = null
+
 			if(jobs.queue.length == 0) {
 				return
 			}
 
-			// get queue job
-			job = jobs.queue.shift()
-
-			validateImage(
-				job.file,
-				() => {
+			// get queue job and validate it
+			validateJob(
+				jobs.queue.shift(),
+				(job) => {
 					// send job
 					const xhttp = new XMLHttpRequest()
 					const formData = new FormData()
 
 					formData.append('upload', job.file)
-					xhttp.addEventListener('load', (event) => uploadComplete(event, job, jobs), false)
-					xhttp.addEventListener('error', (event) => uploadError(event, job, jobs), false)
-					xhttp.addEventListener('abort', (event) => uploadAbort(event, job, jobs), false)
-					xhttp.upload.addEventListener('progress', (event) => uploadProgress(event, job), false)
+					xhttp.addEventListener('load', (event) => {
+						uploadComplete(event, job, jobs)
+						uploadContinue(jobs)
+					}, false)
+					xhttp.addEventListener('error', (event) => {
+						uploadError(event, job, jobs)
+						uploadContinue(jobs)
+					}, false)
+					xhttp.addEventListener('abort', (event) => {
+						uploadAbort(event, job, jobs)
+						uploadContinue(jobs)
+					}, false)
+					xhttp.upload.addEventListener('progress', (event) => {
+						uploadProgress(event, job)
+						uploadContinue(jobs)
+					}, false)
 					xhttp.open('POST', 'upload')
 					xhttp.send(formData)
 				},
-				(error) => {
+				(job, error) => {
 					// show error
 					const details = detailsBox(error)
 
@@ -308,32 +333,30 @@
 					details.classList.add('error')
 					job.uiStatus.append(document.createTextNode('\u00A0'))
 					job.uiStatus.append(details)
-					setTimeout(() => uploadQueue(jobs), 1)
+					uploadContinue(jobs)
 				}
 			)
 		}
 
+		/* continue processing uploads */
+		function uploadContinue(jobs) {
+			if(jobs.queueTimer === null) {
+				jobs.queueTimer = setTimeout(() => uploadQueue(jobs), 1)
+			}
+		}
+
 		/* submit form with chosen files */
-		function submit() {
+		function submit(jobs) {
 			const uiMessage = document.querySelector('#message')
 			const uiWorkspace = document.querySelector('#workspace')
 			const files = document.querySelector('#upload').files
 			const maxFiles = 10
 
-			message.textContent = ''
-			message.style.display = 'none'
+			uiMessage.textContent = ''
 
 			if(files.length > maxFiles ) {
-				message.textContent = `Maximální počet souborů, které můžeš nahrát najednou je ${maxFiles}.`
-				message.style.display = 'block'
+				uiMessage.textContent = `Maximální počet souborů, které můžeš nahrát najednou je ${maxFiles}.`
 			} else {
-				const jobs = {
-					queue: [],
-					jobIds: [],
-					checkTimeout: null
-				}
-
-				document.querySelector('form').style.display = 'none'
 				document.querySelector('#workspace').style.display = 'table'
 
 				// build result ui
@@ -360,25 +383,36 @@
 				}
 
 				// start uploading
-				uploadQueue(jobs)
+				uploadContinue(jobs)
 			}
 		}
 
 		/* attach ui listeners */
-		function init() {
+		function init(jobs) {
 			document.querySelector('form').style.display = 'block';
 
 			document.querySelector('input[type=submit]').style.display = 'none'
 			document.querySelector('#upload').addEventListener('change', event => {
-				submit()
+				submit(jobs)
 			})
 			document.querySelector('form').addEventListener('submit', event => {
 				event.preventDefault()
-				submit()
+				submit(jobs)
 			})
 		}
 
-		init()
+		// create graphics
+		const imageTick = '<svg fill="none" stroke="#4CAF50" version="1.1" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><g transform="matrix(1.9 0 0 2.3 -11 -15)"><path d="m17 7.4c0.31 0.28 0.34 0.75 0.06 1.1l-7.1 8c-0.14 0.16-0.35 0.25-0.56 0.25s-0.42-0.091-0.56-0.25l-2.9-3.2c-0.28-0.31-0.25-0.78 0.06-1.1 0.31-0.28 0.78-0.25 1.1 0.06l2.3 2.6 6.6-7.4c0.28-0.31 0.75-0.34 1.1-0.06z" clip-rule="evenodd" fill="#4caf50" fill-rule="evenodd"/></g></svg>'
+
+		// holds application state
+		const jobs = {
+			queue: [],
+			jobIds: [],
+			checkTimer: null,
+			queueTimer: null
+		}
+
+		init(jobs)
 	</script>
 </body>
 </html>

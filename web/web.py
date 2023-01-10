@@ -143,14 +143,14 @@ def download():
         return {'error': generic_error_message(message)}, 500
 
 
-@app.route('/status')
+@app.route('/status', methods=['POST'])
 def status():
     """
     Get job status
     """
     try:
         # parse params
-        job_ids = request.args.get('ids')
+        job_ids = request.form.get('ids')
         if job_ids is None:
             return {'error': generic_error_message('Missing job ids parameter.')}, 422
 

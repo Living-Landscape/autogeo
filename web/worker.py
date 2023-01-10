@@ -80,7 +80,7 @@ def process(job_id):
                     segment_image = segment_image.resize((segment_image.width * resize_ratio, segment_image.height * resize_ratio), Image.BICUBIC)
                     gc.collect()
                 with io.BytesIO() as image_bytes:
-                    segment_image.save(image_bytes, format='PNG')
+                    segment_image.save(image_bytes, format='png')
                     zip_file.writestr(f'mapa_{n + 1}.png', image_bytes.getvalue())
                 del segment_image
                 gc.collect()

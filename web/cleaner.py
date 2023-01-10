@@ -19,7 +19,7 @@ logging.basicConfig(format='%(asctime)s %(levelname)s %(message)s')
 
 def cleanup(path, ttl, cache):
     """
-    Cleanum path for stale files
+    Cleanup path for stale files
     """
     # TODO will fail to behave correctly when system time is changed
     now = time.time()

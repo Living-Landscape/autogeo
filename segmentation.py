@@ -17,7 +17,6 @@ def should_expand(x, y, image, width, height, mask, edges, min_tolerance, max_to
         0 <= x < width and
         0 <= y < height and
         seen[y, x] == 0 and
-        mask[y, x] > 0 and
         edges[y, x] == 0 and
         min_tolerance[0] < image[y, x, 0] < max_tolerance[0] and
         min_tolerance[1] < image[y, x, 1] < max_tolerance[1] and
@@ -66,6 +65,7 @@ def flood_fill(image, edges, starts, mean, std, scale):
     """
     mask = image[:, :, 3]
     starts = numba.typed.List(starts)
+
     return flood_fill_fast(image, mask, edges, starts, mean, std, scale)
 
 
@@ -83,7 +83,6 @@ def remove_background(image, mask, left, top, right, bottom, min_tolerance, max_
                 min_tolerance[2] < image[y + top, x + left, 2] < max_tolerance[2]
                 ) or 0)):
                 mask[y, x] = 0
-
 
 
 class MapExtractor:
