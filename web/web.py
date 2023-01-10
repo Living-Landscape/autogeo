@@ -264,9 +264,9 @@ def upload():
             worker.process,
             args=(job_id,),
             job_id=job_id,
-            job_timeout=600,
-            result_ttl=600,
-            failure_ttl=600,
+            job_timeout=1800,
+            result_ttl=1800,
+            failure_ttl=1800,
             meta={
                 'name': name,
             },
