@@ -6,6 +6,7 @@ import io
 import zipfile
 import gc
 import logging
+import subprocess
 
 from redis import Redis
 from rq.job import Job
@@ -79,9 +80,23 @@ def process(job_id):
                 if resize_ratio:
                     segment_image = segment_image.resize((segment_image.width * resize_ratio, segment_image.height * resize_ratio), Image.BICUBIC)
                     gc.collect()
+
+                # create image
                 with io.BytesIO() as image_bytes:
                     segment_image.save(image_bytes, format='png')
-                    zip_file.writestr(f'mapa_{n + 1}.png', image_bytes.getvalue())
+
+                    # optimize output image - quantize + compress
+                    try:
+                        process = subprocess.Popen(['pngquant', '-'], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+                        compressed_bytes = process.communicate(input=image_bytes.getvalue())[0]
+                        process = subprocess.Popen(['oxipng', '--strip', 'safe', '-'], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+                        compressed_bytes = process.communicate(input=compressed_bytes)[0]
+                        if len(compressed_bytes) == 0:
+                            compressed_bytes = image_bytes.getvalue()
+                    except Exception:
+                        compressed_bytes = image_bytes.getvalue()
+
+                zip_file.writestr(f'mapa_{n + 1}.png', compressed_bytes)
                 del segment_image
                 gc.collect()
         del extractor
