@@ -29,10 +29,12 @@ class NoMapsFound(RuntimeError):
     pass
 
 
-def process(job_id):
+def process(job_id, output_format):
     """
     Extract map parts
     """
+    assert output_format in ('png', 'webp'), f'Unsupported output format {output_format}'
+
     try:
         job_path = os.path.join('jobs', job_id)
         result_path = os.path.join('results', job_id)
@@ -82,21 +84,27 @@ def process(job_id):
                     gc.collect()
 
                 # create image
-                with io.BytesIO() as image_bytes:
-                    segment_image.save(image_bytes, format='png')
+                if output_format == 'png':
+                    with io.BytesIO() as image_bytes:
+                        segment_image.save(image_bytes, format='png')
 
-                    # optimize output image - quantize + compress
-                    try:
-                        process = subprocess.Popen(['pngquant', '-'], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
-                        compressed_bytes = process.communicate(input=image_bytes.getvalue())[0]
-                        process = subprocess.Popen(['oxipng', '--strip', 'safe', '-'], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
-                        compressed_bytes = process.communicate(input=compressed_bytes)[0]
-                        if len(compressed_bytes) == 0:
+                        # optimize output image - quantize + compress
+                        try:
+                            process = subprocess.Popen(['pngquant', '-'], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+                            compressed_bytes = process.communicate(input=image_bytes.getvalue())[0]
+                            process = subprocess.Popen(['oxipng', '--strip', 'safe', '-'], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+                            compressed_bytes = process.communicate(input=compressed_bytes)[0]
+                            if len(compressed_bytes) == 0:
+                                compressed_bytes = image_bytes.getvalue()
+                        except Exception:
                             compressed_bytes = image_bytes.getvalue()
-                    except Exception:
-                        compressed_bytes = image_bytes.getvalue()
 
-                zip_file.writestr(f'mapa_{n + 1}.png', compressed_bytes)
+                    zip_file.writestr(f'mapa_{n + 1}.png', compressed_bytes)
+                elif output_format == 'webp':
+                    with io.BytesIO() as image_bytes:
+                        segment_image.save(image_bytes, format='webp')
+                        zip_file.writestr(f'mapa_{n + 1}.webp', image_bytes.getvalue())
+
                 del segment_image
                 gc.collect()
         del extractor

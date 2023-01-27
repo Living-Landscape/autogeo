@@ -161,7 +161,8 @@ def status():
 
         # fetch job ids
         try:
-            jobs = Job.fetch_many(set(job_ids), connection=redis)
+            job_ids = list(set(job_ids))
+            jobs = Job.fetch_many(job_ids, connection=redis)
         except Exception as exc:
             return {'error': generic_error_message(str(exc))}, 500
 
@@ -171,8 +172,12 @@ def status():
 
         # iterate through requested ids
         results = {}
-        for job in jobs:
+        for job_id, job, in zip(job_ids, jobs):
             # get response
+            if job is None:
+                results[job_id] = {'error': 'Požadavek na analýzu mapy byl zrušen, zkuste to prosím znovu'}
+                continue
+
             status = job.get_status(refresh=False)
             if status == 'failed':
                 message = job.exc_info.strip().split('\n')[-1]
@@ -262,7 +267,7 @@ def upload():
         # enqueue job
         queue.enqueue(
             worker.process,
-            args=(job_id,),
+            args=(job_id, 'webp'),
             job_id=job_id,
             job_timeout=1800,
             result_ttl=1800,

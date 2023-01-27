@@ -19,7 +19,7 @@
 		#workspace {margin:0 auto;display:none;}
 		#workspace-wrap {overflow-x:auto;margin: 1em;}
 		.download {background-color:#4CAF50;color:white;padding:0.1em 0.3em;border-radius:0.3em;text-decoration:none;}
-		.tick {padding:0.1em 0.4em;}
+		.tick {padding:0.1em 0.4em;cursor:help;}
 		.tick svg {width:0.8em;height:0.8em;}
 		.details {padding:0.1em 0.3em;border-radius:0.3em;cursor:help;}
 		.error {background-color:#c22;color:white;}
@@ -130,44 +130,58 @@
 		}
 
 		/* create info box with message */
-		function detailsBox(message) {
-				const details = document.createElement('span')
+		function detailsBox(job, message, cls) {
+			job.uiDetails.removeAttribute('class')
+			job.uiDetails.classList.add('details')
+			if(cls !== undefined) {
+				job.uiDetails.classList.add(cls)
+			}
+			job.uiDetails.setAttribute('title', message)
 
-				details.classList.add('details')
-				details.textContent = 'info'
-				details.setAttribute('title', message)
-				details.setAttribute('tabindex', '0')
+			job.uiStatus.append(document.createTextNode('\u00A0'))
+			job.uiStatus.append(job.uiDetails)
+		}
 
-				return details
+		/* continue status checking */
+		function checkContinue(jobs, timeout) {
+			if(Object.keys(jobs.jobIds).length > 0) {
+				jobs.checkTimer = setTimeout(() => checkStatus(jobs), timeout)
+			} else {
+				jobs.checkTimer = null
+			}
+		}
+
+		/* check error handler */
+		function checkError(jobs, message, details) {
+			// iterate through job ids
+			for(const [jobId, job] of Object.entries(jobs.jobIds)) {
+				job.uiStatus.textContent = message
+				if(details !== undefined) {
+					detailsBox(job, details, 'error')
+				}
+			}
+
+			checkContinue(jobs, 5000)
 		}
 
 		/* check processing status */
 		function checkStatus(jobs) {
+			const connectionMessageError = 'chyba spojení, může to být dočasné'
 			const xhttp = new XMLHttpRequest()
-
-			// clear check timeout
-			jobs.checkTimer = null
 
 			// create and send check status request
 			xhttp.addEventListener('load', (event) => {
 				let parsedResponse
-				let responseError
 
 				// try to parse response
 				try {
 					parsedResponse = JSON.parse(event.target.response)
 					if('error' in parsedResponse) {
-						responseError = true
+						checkError(jobs, connectionMessageError, parsedResponse.error)
+						return
 					}
 				} catch(error) {
-					responseError = true
-				}
-
-				// keep checking in case of an error
-				if(responseError === true) {
-					if(Object.keys(jobs.jobIds).length> 0 && jobs.checkTimer === null) {
-						jobs.checkTimer = setTimeout(() => checkStatus(jobs), 5000)
-					}
+					checkError(jobs, connectionMessageError)
 					return
 				}
 
@@ -180,15 +194,7 @@
 
 					// add details ui
 					if(parsed.details !== undefined) {
-						const details = detailsBox(parsed.details)
-
-						if(parsed.error) {
-							details.classList.add('error')
-						} else {
-							details.classList.add('info')
-						}
-						job.uiStatus.append(document.createTextNode('\u00A0'))
-						job.uiStatus.append(details)
+						 detailsBox(job, parsed.details, parsed.error ? 'error' : 'info')
 					}
 
 					if(parsed.finished) {
@@ -213,6 +219,7 @@
 									job.uiTick = document.createElement('span')
 									job.uiTick.classList.add('tick')
 									job.uiTick.innerHTML = imageTick
+									job.uiTick.title = 'staženo';
 									job.uiStatus.append(job.uiTick)
 								}
 							})
@@ -223,12 +230,18 @@
 				}
 
 				// check if processing is finished
-				if(Object.keys(jobs.jobIds).length> 0 && jobs.checkTimer === null) {
-					jobs.checkTimer = setTimeout(() => checkStatus(jobs), 1000)
-				}
+				checkContinue(jobs, 2000)
 			}, false)
+
+			// connection errors
+			xhttp.addEventListener('error', event => checkError(jobs, connectionMessageError))
+			xhttp.addEventListener('abort', event => checkError(jobs, connectionMessageError))
+			xhttp.addEventListener('timeout', event => checkError(jobs, connectionMessageError))
+
+			// send request
 			xhttp.open('POST', 'status')
 			xhttp.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded')
+			xhttp.timeout = 60000
 			xhttp.send(`ids=${encodeURIComponent(Object.keys(jobs.jobIds).join(','))}`)
 		}
 
@@ -236,25 +249,18 @@
 		function uploadComplete(event, job, jobs) {
 			let parsedResponse
 
-			// try to parse resonse
+			// try to parse response
 			try {
 				parsedResponse = JSON.parse(event.target.response)
 			} catch {
 				job.uiStatus.textContent = 'chyba při komunikaci se serverem'
-				setTimeout(() => uploadQueue(jobs), 1)
 				return
 			}
 
 			parsed = parseCheckResult(parsedResponse)
 			job.uiStatus.textContent = parsed.message
 			if(parsed.details !== undefined) {
-				const details = detailsBox(parsed.details)
-
-				if(parsed.error) {
-					details.classList.add('error')
-				}
-				jobs.uiStatus.append(document.createTextNode('\u00A0'))
-				jobs.uiStatus.append(details)
+				detailsBox(job, parsed.details, parsed.error ? 'error' : undefined)
 			}
 
 			if(!parsed.error) {
@@ -263,22 +269,19 @@
 				delete job.file
 
 				if(jobs.checkTimer === null) {
-					jobs.checkTimer = setTimeout(() => checkStatus(jobs), 2000)
+					checkContinue(jobs, 1000)
 				}
 			}
-			setTimeout(() => uploadQueue(jobs), 1)
 		}
 
 		/* upload error callback */
 		function uploadError(event, job, jobs) {
 			job.uiStatus.textContent = 'nepodařilo se soubor nahrát'
-			setTimeout(() => uploadQueue(jobs), 1)
 		}
 
 		/* upload abort callback */
 		function uploadAbort(event, job, jobs) {
 			job.uiStatus.textContent = 'nahrávání zrušeno'
-			setTimeout(() => uploadQueue(jobs), 1)
 		}
 
 		/* upload progress callback */
@@ -290,10 +293,8 @@
 
 		/* pick file from queue and process it */
 		function uploadQueue(jobs) {
-			// unregister timer
-			jobs.queueTimer = null
-
 			if(jobs.queue.length == 0) {
+				uploadContinue(jobs)
 				return
 			}
 
@@ -320,19 +321,14 @@
 					}, false)
 					xhttp.upload.addEventListener('progress', (event) => {
 						uploadProgress(event, job)
-						uploadContinue(jobs)
 					}, false)
 					xhttp.open('POST', 'upload')
 					xhttp.send(formData)
 				},
 				(job, error) => {
 					// show error
-					const details = detailsBox(error)
-
 					job.uiStatus.textContent = 'chyba při zpracování'
-					details.classList.add('error')
-					job.uiStatus.append(document.createTextNode('\u00A0'))
-					job.uiStatus.append(details)
+					detailsBox(job, error, 'error')
 					uploadContinue(jobs)
 				}
 			)
@@ -340,7 +336,9 @@
 
 		/* continue processing uploads */
 		function uploadContinue(jobs) {
-			if(jobs.queueTimer === null) {
+			if(jobs.queue.length === 0) {
+				jobs.queueTimer = null
+			} else {
 				jobs.queueTimer = setTimeout(() => uploadQueue(jobs), 1)
 			}
 		}
@@ -364,11 +362,14 @@
 					const uiRow = document.createElement('tr')
 					const uiName = document.createElement('th')
 					const uiStatus = document.createElement('td')
+					const uiDetails = document.createElement('span')
 					const uiDownload = document.createElement('a')
 					const job = {}
 
 					uiName.textContent = file.name
 					uiStatus.textContent = 'čekám na nahrávání'
+					uiDetails.textContent = 'info'
+					uiDetails.setAttribute('tabindex', '0')
 					uiDownload.classList.add('download')
 					uiDownload.textContent = 'stáhnout'
 					uiDownload.setAttribute('href', '#')
@@ -377,13 +378,16 @@
 					uiWorkspace.append(uiRow)
 
 					job.uiStatus = uiStatus
+					job.uiDetails = uiDetails
 					job.uiDownload = uiDownload
 					job.file = file
 					jobs.queue.push(job)
 				}
 
 				// start uploading
-				uploadContinue(jobs)
+				if(jobs.queueTimer === null) {
+					uploadContinue(jobs)
+				}
 			}
 		}
 
