@@ -46,6 +46,17 @@ def process(job_id, output_format):
             raise RuntimeError('Nedokážu přečíst nahrávaný soubor, zpracuju jenom .png a .jpg obrázky.')
         gc.collect()
 
+        # check image mode
+        if image.mode == 'L':
+            raise RuntimeError('Čekal jsem barevný obrázek, ne šedivý')
+        elif image.mode == 'RGB':
+            image.putalpha(255)
+        elif image.mode == 'RGBA':
+            pass
+        else:
+            raise RuntimeError('Obrázek má neznámý formát, umím pracovat jenom s rgb a rgba kanály v .png a .jpg obrázcích.')
+
+        # resize
         dimension = max(image.width, image.height)
         if dimension > 4000:
             resize_ratio = 4
@@ -57,14 +68,7 @@ def process(job_id, output_format):
             image = image.resize((image.width // resize_ratio, image.height // resize_ratio), Image.BICUBIC)
             gc.collect()
 
-        if image.mode == 'L':
-            raise RuntimeError('Čekal jsem barevný obrázek, ne šedivý')
-        elif image.mode == 'RGB':
-            image.putalpha(255)
-        elif image.mode == 'RGBA':
-            pass
-        else:
-            raise RuntimeError('Obrázek má neznámý formát, umím pracovat jenom s rgb a rgba kanály v .png a .jpg obrázcích.')
+        # convert to numpy
         image = np.array(image, dtype=np.uint8)
         gc.collect()
 
@@ -105,14 +109,12 @@ def process(job_id, output_format):
                         segment_image.save(image_bytes, format='webp')
                         zip_file.writestr(f'mapa_{n + 1}.webp', image_bytes.getvalue())
                 elif output_format == 'jpg':
-                    # jpeg image
                     background = Image.new('RGB', segment_image.size, (255, 255, 255))
                     segment_mask = segment_image.getchannel('A')
                     jpg_image = Image.composite(segment_image.convert('RGB'), background, segment_mask)
                     with io.BytesIO() as image_bytes:
                         jpg_image.save(image_bytes, format='jpeg', quality=90, optimize=True)
                         zip_file.writestr(f'mapa_{n + 1}.jpg', image_bytes.getvalue())
-
 
                 del segment_image
                 gc.collect()
