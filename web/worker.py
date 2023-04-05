@@ -33,7 +33,7 @@ def process(job_id, output_format):
     """
     Extract map parts
     """
-    assert output_format in ('png', 'webp'), f'Unsupported output format {output_format}'
+    assert output_format in ('png', 'webp', 'jpg'), f'Unsupported output format {output_format}'
 
     try:
         job_path = os.path.join('jobs', job_id)
@@ -104,9 +104,28 @@ def process(job_id, output_format):
                     with io.BytesIO() as image_bytes:
                         segment_image.save(image_bytes, format='webp')
                         zip_file.writestr(f'mapa_{n + 1}.webp', image_bytes.getvalue())
+                elif output_format == 'jpg':
+                    # jpeg image
+                    background = Image.new('RGB', segment_image.size, (255, 255, 255))
+                    segment_mask = segment_image.getchannel('A')
+                    jpg_image = Image.composite(segment_image.convert('RGB'), background, segment_mask)
+                    with io.BytesIO() as image_bytes:
+                        jpg_image.save(image_bytes, format='jpeg', quality=90, optimize=True)
+                        zip_file.writestr(f'mapa_{n + 1}.jpg', image_bytes.getvalue())
+
 
                 del segment_image
                 gc.collect()
+
+            # background colors
+            if output_format == 'jpg':
+                background_colors = '\n'.join(
+                    f'{r} {g} {b} 100'
+                    for r in range(250, 256)
+                    for g in range(250, 256)
+                    for b in range(250, 256)
+                )
+                zip_file.writestr('pozadi.txt', background_colors)
         del extractor
         del image
         gc.collect()

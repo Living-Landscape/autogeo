@@ -1,4 +1,5 @@
 #!/bin/bash
+set -e
 
 # run
 docker build -t autogeo "$(dirname "$(realpath "$0")")"
