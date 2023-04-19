@@ -13,7 +13,8 @@ from rq.job import Job
 from PIL import Image
 import numpy as np
 
-import segmentation
+from model_simple import SimpleDetector
+from model_nnet import NNetDetector
 
 
 # create logger
@@ -29,10 +30,11 @@ class NoMapsFound(RuntimeError):
     pass
 
 
-def process(job_id, output_format):
+def process(job_id, detector_type, output_format):
     """
     Extract map parts
     """
+    assert detector_type in ('simple', 'nnet'), f'Unsupported detector type {detector_type}'
     assert output_format in ('png', 'webp', 'jpg'), f'Unsupported output format {output_format}'
 
     try:
@@ -73,15 +75,18 @@ def process(job_id, output_format):
         gc.collect()
 
         # extract map blobs
-        extractor = segmentation.MapExtractor(image)
-        extractor.extract()
-        if not extractor.segments:
+        if detector_type == 'simple':
+            detector = SimpleDetector(image)
+        elif detector_type == 'nnet':
+            detector = NNetDetector(image)
+        detector.detect()
+        if not detector.segments:
             raise NoMapsFound('Nepodařilo se najít žádné mapy na obrázku.')
 
         # zip with images
         with zipfile.ZipFile(result_path, 'w', zipfile.ZIP_DEFLATED) as zip_file:
-            for n, segment in enumerate(extractor.segments):
-                segment_image = Image.fromarray(extractor.draw_segment(segment, shrink=True))
+            for n, segment in enumerate(detector.segments):
+                segment_image = Image.fromarray(detector.draw_segment(segment, shrink=True))
                 gc.collect()
                 if resize_ratio:
                     segment_image = segment_image.resize((segment_image.width * resize_ratio, segment_image.height * resize_ratio), Image.BICUBIC)
@@ -128,7 +133,7 @@ def process(job_id, output_format):
                     for b in range(250, 256)
                 )
                 zip_file.writestr('pozadi.txt', background_colors)
-        del extractor
+        del detector
         del image
         gc.collect()
 

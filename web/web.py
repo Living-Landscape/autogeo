@@ -267,7 +267,7 @@ def upload():
         # enqueue job
         queue.enqueue(
             worker.process,
-            args=(job_id, 'jpg'),
+            args=(job_id, 'nnet', 'jpg'),
             job_id=job_id,
             job_timeout=1800,
             result_ttl=1800,
