@@ -23,13 +23,13 @@ class TFLiteModel:
         inputs = {}
         for inp in self.interpreter.get_input_details():
             inputs[inp['name']] = inp
-            print('input', inp['name'])
+            #print('input', inp['name'])
 
         # output details
         outputs = {}
         for out in self.interpreter.get_output_details():
             outputs[out['name']] = out
-            print('output', out['name'])
+            #print('output', out['name'])
 
         self.in_img = inputs['serving_default_input_2:0']
         self.p_out = outputs['StatefulPartitionedCall:0']
@@ -62,11 +62,11 @@ class NNetDetector(Detector):
     Detect map parts
     """
 
-    def __init__(self, image):
+    def __init__(self, model_path, image):
         self.image = image
         self.image_height, self.image_width = image.shape[:2]
         self.image_mask = None
-        self.model = TFLiteModel('model_nnet.tflite')
+        self.model = TFLiteModel(model_path)
         self.segments = None
 
 
@@ -78,6 +78,12 @@ class NNetDetector(Detector):
         overlap = 128
 
         image = self.image
+
+        # check for too small images
+        if self.image_width < chunk_size or self.image_height < chunk_size:
+            self.image_mask = np.zeros(image.shape[:2], np.uint8)
+            self.segments = []
+            return
 
         # run nnet inference on chunks, averaging results
         self.image_mask = np.zeros(image.shape[:2], np.float32)

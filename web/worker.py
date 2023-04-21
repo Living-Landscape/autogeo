@@ -78,7 +78,7 @@ def process(job_id, detector_type, output_format):
         if detector_type == 'simple':
             detector = SimpleDetector(image)
         elif detector_type == 'nnet':
-            detector = NNetDetector(image)
+            detector = NNetDetector('model_nnet.tflite', image)
         detector.detect()
         if not detector.segments:
             raise NoMapsFound('Nepodařilo se najít žádné mapy na obrázku.')
