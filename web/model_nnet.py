@@ -70,7 +70,7 @@ class NNetDetector(Detector):
         self.segments = None
 
 
-    def detect(self):
+    def detect(self, progress_callback=None):
         """
         Detect map segments
         """
@@ -89,7 +89,11 @@ class NNetDetector(Detector):
         self.image_mask = np.zeros(image.shape[:2], np.float32)
         counts = np.zeros(image.shape[:2], np.uint8)
         for x in range(0, image.shape[1], chunk_size - overlap):
-            for y in range(0, image.shape[0], chunk_size):
+            for y in range(0, image.shape[0], chunk_size - overlap):
+                if progress_callback is not None:
+                    progress_current = y + x * image.shape[0]
+                    progress_total = image.shape[0] * image.shape[1]
+                    progress_callback(progress_current / progress_total)
                 left = x
                 right = min(x + chunk_size, image.shape[1])
                 top = y

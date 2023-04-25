@@ -7,6 +7,7 @@ import zipfile
 import gc
 import logging
 import subprocess
+import time
 
 from redis import Redis
 from rq.job import Job
@@ -41,6 +42,8 @@ def process(job_id, detector_type, output_format):
         job_path = os.path.join('jobs', job_id)
         result_path = os.path.join('results', job_id)
 
+        job = Job.fetch(job_id, connection=Redis())
+
         # decode image
         try:
             image = Image.open(job_path)
@@ -74,12 +77,26 @@ def process(job_id, detector_type, output_format):
         image = np.array(image, dtype=np.uint8)
         gc.collect()
 
+        def progress_fn(progress):
+            """Keep an eye on computation progress."""
+            nonlocal last_progress_update
+
+            update_delay = 1  # minimum delay between updates in s
+
+            now = time.time()
+            if last_progress_update is None or now - last_progress_update > update_delay:
+                job.meta['progress'] = progress * 0.95  # adjustment for zipping files
+                job.save()
+                last_progress_update = now
+
         # extract map blobs
         if detector_type == 'simple':
             detector = SimpleDetector(image)
+            detector.detect()
         elif detector_type == 'nnet':
             detector = NNetDetector('model_nnet.tflite', image)
-        detector.detect()
+            last_progress_update = None
+            detector.detect(progress_fn)
         if not detector.segments:
             raise NoMapsFound('Nepodařilo se najít žádné mapy na obrázku.')
 
@@ -137,7 +154,6 @@ def process(job_id, detector_type, output_format):
         del image
         gc.collect()
 
-        job = Job.fetch(job_id, connection=Redis())
         job.meta['download'] = True
         job.save()
 

@@ -263,25 +263,56 @@ def rgb_to_oklab(images):
     )
 
 
+def rai_initializer(kernel_width, kernel_height, input_features, output_features):
+    """Randomized asymmetric initializer"""
+    receptive_field = kernel_height * kernel_width
+    fan_in = input_features * receptive_field
+    fan_out = output_features * receptive_field
+
+    V = np.random.randn(fan_out, fan_in + 1) * 0.6007 / fan_in ** 0.5
+    for j in range(fan_out):
+        k = np.random.randint(0, high=fan_in + 1)
+        V[j, k] = np.random.beta(2, 1)
+    W = V[:, :-1].T
+    b = V[:, -1]
+
+    return W.astype(np.float32), b.astype(np.float32)
+
+
+class RAIConv2D(layers.Conv2D):
+
+    def build(self, input_shape):
+        kernel_weights, bias_weights = rai_initializer(*self.kernel_size, input_shape[-1], self.filters)
+        self.kernel_initializer = tf.constant_initializer(kernel_weights)
+        self.bias_initializer = tf.constant_initializer(bias_weights)
+        super().build(input_shape)
+
+
+class RAIDepthwiseConv2D(layers.DepthwiseConv2D):
+
+    def build(self, input_shape):
+        kernel_weights, bias_weights = rai_initializer(*self.kernel_size, input_shape[-1], input_shape[-1])
+        self.kernel_initializer = tf.constant_initializer(kernel_weights)
+        self.bias_initializer = tf.constant_initializer(bias_weights)
+        #print(kernel_weights.shape, bias_weights.shape)
+        super().build(input_shape)
+
+
 def conv_block(x, output_filters):
     expansion = 2
     inputs = x
-    normalize = inputs.shape[3] >= 8
 
     # expansion
-    x = alayers.WeightNormalization(layers.Conv2D(expansion * inputs.shape[3], 1, padding='valid', use_bias=True))(x)
-    if normalize:
-        x = alayers.GroupNormalization(groups=8, axis=-1)(x)
-    x = layers.LeakyReLU()(x)
+    x = RAIConv2D(expansion * inputs.shape[3], 1, padding='valid', use_bias=True)(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.ReLU()(x)
 
     # depthwise
-    x = layers.DepthwiseConv2D(3, 1, padding='same', use_bias=False)(x)
-    x = layers.LeakyReLU()(x)
+    x = RAIDepthwiseConv2D(3, 1, padding='same', use_bias=False)(x)
+    x = layers.ReLU()(x)
 
     # contraction
-    x = alayers.WeightNormalization(layers.Conv2D(output_filters, 1, padding='valid', use_bias=False))(x)
-    if normalize:
-        x = alayers.GroupNormalization(groups=4, axis=-1)(x)
+    x = RAIConv2D(output_filters, 1, padding='valid', use_bias=False)(x)
 
     # results
     if inputs.shape[3] == output_filters:
@@ -347,15 +378,15 @@ def unet(mode):
 
     # outputs and model
     if mode == 'unsupervised':
-        outputs = layers.Conv2D(3, 1, padding='same')(features)
+        outputs = RAIConv2D(3, 1, padding='same')(features)
         model = tf.keras.Model(inputs, outputs, name='unet')
         model.compile(optimizer=optimizers.Adam(), loss=unsupervised_loss)
     elif mode == 'weak':
-        outputs = layers.Conv2D(1, 1, padding='same')(features)
+        outputs = RAIConv2D(1, 1, padding='same')(features)
         model = tf.keras.Model(inputs, outputs, name='unet')
         model.compile(optimizer=optimizers.Adam(), loss=weak_loss, metrics=dice_loss)
     elif mode == 'supervised':
-        outputs = layers.Conv2D(1, 1, padding='same')(features)
+        outputs = RAIConv2D(1, 1, padding='same')(features)
         model = tf.keras.Model(inputs, outputs, name='unet')
         model.compile(optimizer=optimizers.Adam(), loss=supervised_loss, metrics=dice_loss)
     else:

@@ -203,6 +203,9 @@ def status():
                 results[job.id] = {'status': status, 'position': position}
             else:
                 results[job.id] = {'status': status}
+                progress = job.meta.get('progress')
+                if progress is not None:
+                    results[job.id].update({'progress': progress})
 
         return results
     except Exception as exc:

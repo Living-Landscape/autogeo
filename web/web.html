@@ -94,8 +94,14 @@
 						error: false
 					}
 				} else if(checkResult.status == 'started') {
+					if(checkResult.progress === undefined) {
+						message ='zpracovávám, chvilku to potrvá'
+					} else {
+						message =`zpracovávám, ${Math.round(checkResult.progress * 100)}%`
+					}
+
 					return {
-						message: 'zpracovávám, chvilku to potrvá',
+						message: message,
 						details: checkResult.info,
 						finished: false,
 						download: false,
