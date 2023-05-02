@@ -85,9 +85,9 @@ def image_icon():
     return response
 
 
-@app.route('/preview.png')
+@app.route('/preview.jpg')
 def image_preview():
-    response = make_response(send_from_directory('.', 'web_preview.png'))
+    response = make_response(send_from_directory('.', 'web_preview.jpg'))
     response.headers['cache-control'] = 'public'
     response.headers['expires'] = (datetime.utcnow() + timedelta(30)).strftime("%a, %d %b %Y %H:%M:%S GMT")
     return response
@@ -270,7 +270,7 @@ def upload():
         # enqueue job
         queue.enqueue(
             worker.process,
-            args=(job_id, 'nnet', 'webp'),
+            args=(job_id, 'nnet', 'jpg'),
             job_id=job_id,
             job_timeout=1800,
             result_ttl=1800,

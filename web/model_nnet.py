@@ -23,15 +23,13 @@ class TFLiteModel:
         inputs = {}
         for inp in self.interpreter.get_input_details():
             inputs[inp['name']] = inp
-            #print('input', inp['name'])
 
         # output details
         outputs = {}
         for out in self.interpreter.get_output_details():
             outputs[out['name']] = out
-            #print('output', out['name'])
 
-        self.in_img = inputs['serving_default_input_2:0']
+        self.in_img = inputs['serving_default_input_1:0']
         self.p_out = outputs['StatefulPartitionedCall:0']
 
     def predict(self, image):
@@ -74,8 +72,8 @@ class NNetDetector(Detector):
         """
         Detect map segments
         """
-        chunk_size = 256
-        overlap = 128
+        chunk_size = 512
+        overlap = 256
 
         image = self.image
 

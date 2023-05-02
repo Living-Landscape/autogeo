@@ -8,7 +8,6 @@ import numpy as np
 import tensorflow as tf
 from tensorflow.keras import layers
 from tensorflow.keras import optimizers
-from tensorflow_addons import layers as alayers
 from PIL import Image, ImageEnhance, ImageOps
 
 
@@ -132,7 +131,9 @@ def dice_loss(y_true, y_pred, weights=None, weights_sum=None):
     """
     Dice loss
     """
-    eps = 1e-6
+    # TODO: water and grass not yet implemented
+    y_true = y_true[..., :1]
+    y_pred = y_pred[..., :1]
 
     y_true = tf.cast(y_true, tf.float32)
     y_pred = tf.math.sigmoid(y_pred)
@@ -144,13 +145,16 @@ def dice_loss(y_true, y_pred, weights=None, weights_sum=None):
     nominator = 2 * tf.reduce_sum(weights * y_true * y_pred, axis=(1, 2)) / weights_sum
     denominator = tf.reduce_sum(weights * (y_true + y_pred), axis=(1, 2)) / weights_sum
 
-    return 1 - (nominator + eps) / (denominator + eps)
+    return 1 - (nominator + 1) / (denominator + 1)
 
 
 def weak_loss(y_true, y_pred):
     """
     Combined dice and cross entropy loss
     """
+    # TODO: water and grass not yet implemented
+    y_true = y_true[..., :1]
+    y_pred = y_pred[..., :1]
     eps = 1e-6
 
     y_true = tf.cast(y_true, tf.float32)
@@ -205,6 +209,10 @@ def supervised_loss(y_true, y_pred):
     """
     Supervised loss
     """
+    # TODO: water and grass not yet implemented
+    y_true = y_true[..., :1]
+    y_pred = y_pred[..., :1]
+
     eps = 1e-6
 
     y_true = tf.cast(y_true, tf.float32)
@@ -215,28 +223,33 @@ def supervised_loss(y_true, y_pred):
     negative = (1 - edges) * (1 - y_true)
 
     # area weights
+    edge_coef = 4
     shape = tf.shape(y_true)
-    all_sum = tf.cast(shape[0] * shape[1] * shape[2], tf.float32)
-    pos_weight = tf.reduce_sum(positive, axis=(0, 1, 2), keepdims=True) / all_sum
-    neg_weight = tf.reduce_sum(negative, axis=(0, 1, 2), keepdims=True) / all_sum
-    edge_weight = tf.reduce_sum(edges, axis=(0, 1, 2), keepdims=True) / all_sum
+    area_sum = tf.cast(shape[1] * shape[2], tf.float32)
+    pos_ratio = tf.reduce_sum(positive, axis=(1, 2), keepdims=True) / area_sum
+    neg_ratio = tf.reduce_sum(negative, axis=(1, 2), keepdims=True) / area_sum
+    edge_ratio = 1 / edge_coef * tf.reduce_sum(edges, axis=(1, 2), keepdims=True) / area_sum
+
+    pos_weight = (1 + eps) / (pos_ratio + eps)
+    neg_weight = (1 + eps) / (neg_ratio + eps)
+    edge_weight = (1 + eps) / (edge_ratio + eps)
 
     # combine weights
-    edge_coef = 4
-    weights = eps + (1 - pos_weight) * positive + (1 - neg_weight) * negative + edge_coef * (1 - edge_weight) * edges
-    weights_sum = tf.reduce_sum(weights, axis=(0, 1, 2), keepdims=True)
-
-    """
-    weights = compute_image_weights(y_true)[..., tf.newaxis]
+    weights = pos_weight * positive + neg_weight * negative + edge_weight * edges
     weights_sum = tf.reduce_sum(weights, axis=(1, 2), keepdims=True)
-    """
 
     # cross entropy
     cross_entropy = tf.nn.sigmoid_cross_entropy_with_logits(y_true, y_pred)
-    cross_entropy = tf.reduce_sum(weights * cross_entropy, axis=(0, 1, 2)) / weights_sum
-    #cross_entropy = tf.reduce_sum(weights * cross_entropy, axis=(1, 2)) / weights_sum
+    cross_entropy = tf.reduce_sum(weights * cross_entropy, axis=(1, 2)) / weights_sum
 
     return cross_entropy
+
+
+def zero_loss(y_true, y_pred):
+    """
+    Dummy loss
+    """
+    return 0.0 * y_pred
 
 
 def rgb_to_oklab(images):
@@ -263,132 +276,147 @@ def rgb_to_oklab(images):
     )
 
 
-def rai_initializer(kernel_width, kernel_height, input_features, output_features):
-    """Randomized asymmetric initializer"""
-    receptive_field = kernel_height * kernel_width
-    fan_in = input_features * receptive_field
-    fan_out = output_features * receptive_field
+def msf_block(inputs, filters, scale='same'):
+    """
+    Mutli-scale fusion step
+    """
+    assert len(inputs) == len(filters)
+    assert scale in ('down', 'up', 'same')
 
-    V = np.random.randn(fan_out, fan_in + 1) * 0.6007 / fan_in ** 0.5
-    for j in range(fan_out):
-        k = np.random.randint(0, high=fan_in + 1)
-        V[j, k] = np.random.beta(2, 1)
-    W = V[:, :-1].T
-    b = V[:, -1]
+    scales = len(inputs)
+    x = scales * [None]
+    for n in range(scales):
+        # scale
+        if scale == 'down':
+            size = inputs[n].shape[1]
+            x[n] = tf.image.resize(inputs[n], (size // 2, size // 2))
+        elif scale == 'up':
+            size = inputs[n].shape[1]
+            x[n] = tf.image.resize(inputs[n], (size * 2, size * 2))
+        else:
+            x[n] = inputs[n]
 
-    return W.astype(np.float32), b.astype(np.float32)
+        # convolution
+        x[n] = layers.Conv2D(filters[n], 1, padding='valid')(x[n])
+        x[n] = layers.BatchNormalization()(x[n])
+        x[n] = layers.LeakyReLU()(x[n])
+        x[n] = layers.DepthwiseConv2D(3, 1, padding='same')(x[n])
+        x[n] = layers.LeakyReLU()(x[n])
+
+    # merge
+    merged = scales * [None]
+    for n in range(scales):
+        size = x[n].shape[1]
+
+        merged[n] = x[n]
+        filter_count = x[n].shape[-1]
+        if n > 0:
+            # upsample
+            if filter_count == x[n - 1].shape[-1]:
+                merged[n] += tf.image.resize(x[n - 1], (size, size))
+            elif filter_count > x[n - 1].shape[-1]:
+                merged[n] = tf.concat([
+                    merged[n][..., :x[n - 1].shape[-1]] + tf.image.resize(x[n - 1], (size, size)),
+                    merged[n][..., x[n - 1].shape[-1]:],
+                ], axis=-1)
+                #pass  # needs padding - too slow
+            else:
+                merged[n] += tf.image.resize(x[n - 1][..., :filter_count], (size, size))
+        if n < scales - 1:
+            # downsample
+            if filter_count == x[n + 1].shape[-1]:
+                merged[n] += tf.image.resize(x[n + 1], (size, size))
+            elif filter_count > x[n + 1].shape[-1]:
+                merged[n] = tf.concat([
+                    merged[n][..., :x[n + 1].shape[-1]] + tf.image.resize(x[n + 1], (size, size)),
+                    merged[n][..., x[n + 1].shape[-1]:],
+                ], axis=-1)
+                #pass  # needs padding - too slow
+            else:
+                merged[n] += tf.image.resize(x[n + 1][..., :filter_count], (size, size))
 
 
-class RAIConv2D(layers.Conv2D):
+    for n in range(scales):
+        # projection
+        x[n] = layers.Conv2D(filters[n], 1, padding='valid')(merged[n])
+        x[n] = layers.BatchNormalization()(x[n])
+        x[n] = layers.LeakyReLU()(x[n])
 
-    def build(self, input_shape):
-        kernel_weights, bias_weights = rai_initializer(*self.kernel_size, input_shape[-1], self.filters)
-        self.kernel_initializer = tf.constant_initializer(kernel_weights)
-        self.bias_initializer = tf.constant_initializer(bias_weights)
-        super().build(input_shape)
+        # convoluton
+        x[n] = layers.DepthwiseConv2D(3, 1, padding='same')(x[n])
+        x[n] = layers.LeakyReLU()(x[n])
+        x[n] = layers.Conv2D(filters[n], 1, padding='valid')(x[n])
 
-
-class RAIDepthwiseConv2D(layers.DepthwiseConv2D):
-
-    def build(self, input_shape):
-        kernel_weights, bias_weights = rai_initializer(*self.kernel_size, input_shape[-1], input_shape[-1])
-        self.kernel_initializer = tf.constant_initializer(kernel_weights)
-        self.bias_initializer = tf.constant_initializer(bias_weights)
-        #print(kernel_weights.shape, bias_weights.shape)
-        super().build(input_shape)
-
-
-def conv_block(x, output_filters):
-    expansion = 2
-    inputs = x
-
-    # expansion
-    x = RAIConv2D(expansion * inputs.shape[3], 1, padding='valid', use_bias=True)(x)
-    x = layers.BatchNormalization()(x)
-    x = layers.ReLU()(x)
-
-    # depthwise
-    x = RAIDepthwiseConv2D(3, 1, padding='same', use_bias=False)(x)
-    x = layers.ReLU()(x)
-
-    # contraction
-    x = RAIConv2D(output_filters, 1, padding='valid', use_bias=False)(x)
-
-    # results
-    if inputs.shape[3] == output_filters:
-        return layers.add([inputs, x])
-    else:
-        return x
-
-
-def double_conv_block(x, n_filters):
-    x = conv_block(x, n_filters)
-    x = conv_block(x, n_filters)
+        # output
+        if inputs[n].shape == x[n].shape:
+            x[n] = layers.add([inputs[n], x[n]])
 
     return x
 
 
-def downsample_block(x, n_filters):
-    # covolutions
-    f = double_conv_block(x, n_filters)
-
-    # downsample
-    p = layers.MaxPool2D(2)(f)
-
-    return f, p
-
-
-def upsample_block(x, conv_features, n_filters):
-   # upsample
-   x = layers.Conv2DTranspose(n_filters, 3, 2, padding='same')(x)
-
-   # concatenate
-   x = layers.concatenate([x, conv_features])
-
-   # convolutions
-   x = double_conv_block(x, n_filters)
-
-   return x
-
-
-def unet(mode):
-    img_size = (256, 256)
+def msf(mode):
+    img_size = (512, 512)
+    scales = 5
+    filters = [24, 32, 64, 64, 64, 64, 64, 64]
 
     # input
     inputs = layers.Input(shape=img_size + (3,), dtype=tf.float32)
-    inputs = rgb_to_oklab(inputs)
 
-    # downsample
-    f1, p1 = downsample_block(inputs, 32)
-    f2, p2 = downsample_block(p1, 32)
-    f3, p3 = downsample_block(p2, 64)
-    f4, p4 = downsample_block(p3, 64)
+    # intro
+    inputs_oklab = rgb_to_oklab(inputs)
 
-    #  bottleneck
-    b = double_conv_block(p4, 64)
-    b = double_conv_block(b, 64)
-    b = double_conv_block(b, 64)
-    b = double_conv_block(b, 64)
+    # downscale
+    x = scales * [None]
+    size = inputs_oklab.shape[1]
+    x[0] = inputs_oklab
+    for n in range(1, scales):
+        size = size // 2
+        x[n] = tf.image.resize(inputs_oklab, (size, size))
 
-    # upsample
-    u4 = upsample_block(b, f4, 64)
-    u3 = upsample_block(u4, f3, 64)
-    u2 = upsample_block(u3, f2, 32)
-    features = upsample_block(u2, f1, 32)
+    # encoder
+    x = msf_block(x, filters[0:scales + 0], 'down')
+    a = x
+    x = msf_block(x, filters[1:scales + 1], 'down')
+    b = x
+    x = msf_block(x, filters[2:scales + 2], 'down')
+    c = x
+    x = msf_block(x, filters[3:scales + 3], 'same')
+    x = msf_block(x, filters[3:scales + 3], 'same')
+
+    # decoder
+    x = msf_block(x, filters[3:scales + 3], 'same')
+    x = msf_block(x, filters[3:scales + 3], 'same')
+    x = msf_block(x, filters[2:scales + 2], 'same')
+    for n in range(scales):
+        x[n] += c[n]
+    x = msf_block(x, filters[1:scales + 1], 'up')
+    for n in range(scales):
+        x[n] += b[n]
+    x = msf_block(x, filters[0:scales + 0], 'up')
+    for n in range(scales):
+        x[n] += a[n]
 
     # outputs and model
     if mode == 'unsupervised':
-        outputs = RAIConv2D(3, 1, padding='same')(features)
-        model = tf.keras.Model(inputs, outputs, name='unet')
+        outputs = msf_block(x, [3] + filters[0:scales - 1], 'up')[0]  # map, water, grass
+        model = tf.keras.Model(inputs, outputs, name='msf')
         model.compile(optimizer=optimizers.Adam(), loss=unsupervised_loss)
     elif mode == 'weak':
-        outputs = RAIConv2D(1, 1, padding='same')(features)
-        model = tf.keras.Model(inputs, outputs, name='unet')
-        model.compile(optimizer=optimizers.Adam(), loss=weak_loss, metrics=dice_loss)
+        outputs = msf_block(x, [3] + filters[0:scales - 1], 'up')[0]  # map, water, grass
+        model = tf.keras.Model(inputs, outputs, name='msf')
+        model.compile(
+            optimizer=optimizers.Adam(),
+            loss=weak_loss,
+            metrics=dice_loss,
+        )
     elif mode == 'supervised':
-        outputs = RAIConv2D(1, 1, padding='same')(features)
-        model = tf.keras.Model(inputs, outputs, name='unet')
-        model.compile(optimizer=optimizers.Adam(), loss=supervised_loss, metrics=dice_loss)
+        outputs = msf_block(x, [3] + filters[0:scales - 1], 'up')[0]  # map, water, grass
+        model = tf.keras.Model(inputs, outputs, name='msf')
+        model.compile(
+            optimizer=optimizers.Adam(),
+            loss=supervised_loss,
+            metrics=dice_loss,
+        )
     else:
         assert False, f'unknown mode {mode}'
 
@@ -661,8 +689,9 @@ def iterate_unsupervised(dataset_path, batch_size, shuffle=True, augment=True):
             image_file = image_paths[name]['image']
 
             # read image
-            image = cv2.imread(image_file, cv2.IMREAD_COLOR)
-            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            image = Image.open(image_file)
+            assert image.mode == 'RGB'
+            image = np.asarray(image)
             width, height = image.shape[:2]
 
             # augment
@@ -712,10 +741,17 @@ def iterate_supervised(dataset_path, batch_size, shuffle=True, augment=True):
             map_file = image_paths[name]['map']
 
             # read images
-            image = cv2.imread(image_file, cv2.IMREAD_COLOR)
-            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-            map_mask = cv2.imread(map_file, cv2.IMREAD_GRAYSCALE)
+            image = Image.open(image_file)
+            assert image.mode == 'RGB'
+            image = np.asarray(image)
             width, height = image.shape[:2]
+
+            map_mask = Image.open(map_file)
+            assert map_mask.mode == 'L'
+            map_mask = np.asarray(map_mask)
+
+            water_mask = np.zeros_like(map_mask)
+            grass_mask = np.zeros_like(map_mask)
 
             # augment
             if augment:
@@ -728,7 +764,13 @@ def iterate_supervised(dataset_path, batch_size, shuffle=True, augment=True):
 
             # add to batch
             batch_inputs.append(augmented_image)
-            batch_outputs.append(map_mask[..., np.newaxis] / 255)
+            batch_outputs.append(
+                np.concatenate([
+                    map_mask[..., np.newaxis],
+                    water_mask[..., np.newaxis],
+                    grass_mask[..., np.newaxis],
+                ], axis=-1) / 255
+            )
 
             # yield batch
             if len(batch_inputs) == batch_size:

@@ -36,6 +36,6 @@ RUN apt-get install --no-install-recommends --yes python3-pip && \
 
 # install main app
 COPY supervisord.conf /etc/supervisor/conf.d/supervisord.conf
-COPY web.py web.html web_preview.png web_icon.png model.py model_simple.py model_nnet.py model_nnet.tflite imagesize.py worker.py cleaner.py /app/
+COPY web.py web.html web_preview.jpg web_icon.png model.py model_simple.py model_nnet.py model_nnet.tflite imagesize.py worker.py cleaner.py /app/
 
 CMD ["/usr/bin/supervisord", "-c", "/etc/supervisor/supervisord.conf"]
