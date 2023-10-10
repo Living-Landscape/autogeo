@@ -25,7 +25,7 @@ def prediction_confidence(predictions, thresholds):
 class TFLiteModel:
 
     def __init__(self, path):
-        self.thresholds = (0.82, 0.55, 0.5)
+        self.thresholds = (0.79, 0.68, 0.5)
 
         self.interpreter = tflite.Interpreter(model_path=path)
         self.interpreter.allocate_tensors()
