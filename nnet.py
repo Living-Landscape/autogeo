@@ -1,104 +1,13 @@
-# interactive segmentation https://github.com/saic-vul/ritm_interactive_segmentation
 
 import os
 import random
+import json
 
 import cv2
 import numpy as np
 import tensorflow as tf
 from tensorflow.keras import layers
-from tensorflow.keras import optimizers
 from PIL import Image, ImageEnhance, ImageOps
-
-
-def gaussian_blur(x, kernel_size=11, sigma=5):
-    """
-    Blur images
-    """
-    ax = tf.range(-kernel_size // 2 + 1.0, kernel_size // 2 + 1.0)
-    xx, yy = tf.meshgrid(ax, ax)
-    kernel = tf.exp(-(xx ** 2 + yy ** 2) / (2.0 * sigma ** 2))
-    kernel = kernel / tf.reduce_sum(kernel)
-    kernel = tf.tile(kernel[..., tf.newaxis], [1, 1, 1])
-
-    x = x[..., tf.newaxis]
-    x_pad = (kernel_size // 2, kernel_size // 2)
-    x = tf.pad(x, [(0, 0), x_pad, x_pad, (0, 0)], 'reflect')
-    x = tf.nn.depthwise_conv2d(x, kernel[..., tf.newaxis], [1, 1, 1, 1], padding='VALID')
-
-    return x[..., 0]
-
-
-def detect_edges(x):
-    """
-    Detect edges inside the images
-    """
-    grad_components = tf.image.sobel_edges(x)
-    grad_mag_components = grad_components**2
-    grad_mag_square = tf.reduce_sum(grad_mag_components,axis=-1)
-
-    return tf.sqrt(grad_mag_square)
-
-
-def compute_pixel_weights(x):
-    """
-    Compute pixel weights
-    """
-    # TODO figure out the shape
-    #shape = tf.shape(x)
-    shape = (16, 256, 256, 3)
-
-    # quantize inputs to (256 // 16) ** 3 = 4069 values
-    quantized = x // 16
-    if shape[-1] == 1:
-        quantized = quantized[..., 0]
-    elif shape[-1] == 3:
-        quantized = quantized[..., 0] + 16 * quantized[..., 1] + 256 * quantized[..., 2]
-    else:
-        assert False
-    flattened = tf.reshape(quantized, (-1,))
-    values, indices, counts = tf.unique_with_counts(flattened)
-    pixel_count = shape[0] * shape[1] * shape[2]
-    min_counts = pixel_count // 16384
-    max_counts = pixel_count // 256
-    counts = tf.clip_by_value(counts, min_counts, max_counts)
-    sum_counts = tf.reduce_sum(counts)
-    weights = (min_counts + max_counts - counts) / sum_counts
-    weights = tf.cast(weights, tf.float32)
-
-    # create pixel mask
-    pixel_mask = tf.gather(weights, indices)
-    pixel_mask = tf.reshape(pixel_mask, shape[:3])
-    pixel_mask = pixel_mask / tf.reduce_max(pixel_mask)
-
-    return pixel_mask
-
-
-def compute_edge_weights(x):
-    """
-    Compute edge weights
-    """
-    if x.shape[-1] == 3:
-        x = rgb_to_oklab(x)
-
-    edge_mask = detect_edges(x[..., :1])[..., 0]
-    edge_mask = tf.cast(edge_mask, tf.float32)
-    edge_mask = edge_mask / tf.reduce_max(edge_mask, axis=(1, 2), keepdims=True)
-
-    return edge_mask
-
-
-def compute_image_weights(x):
-    """
-    Compute image weights
-    """
-    pixel_mask = compute_pixel_weights(x)
-    edge_mask = compute_edge_weights(x)
-
-    mask = gaussian_blur(pixel_mask + edge_mask)
-    mask = mask / tf.reduce_sum(mask, axis=(1, 2), keepdims=True)
-
-    return mask
 
 
 def unsupervised_loss(y_true, y_pred):
@@ -114,38 +23,6 @@ def unsupervised_loss(y_true, y_pred):
 
     l1 = tf.reduce_sum(tf.abs(y_true - y_pred), axis=-1)
     return tf.reduce_mean(l1, axis=(1, 2))
-
-
-def l1_loss(y_true, y_pred):
-    """
-    L1 loss
-    """
-    y_true = tf.cast(y_true, tf.float32)
-
-    l1 = tf.reduce_sum(tf.abs(y_true - y_pred), axis=-1)
-
-    return tf.reduce_mean(l1, axis=(1, 2))
-
-
-def dice_loss(y_true, y_pred, weights=None, weights_sum=None):
-    """
-    Dice loss
-    """
-    # TODO: water and grass not yet implemented
-    y_true = y_true[..., :1]
-    y_pred = y_pred[..., :1]
-
-    y_true = tf.cast(y_true, tf.float32)
-    y_pred = tf.math.sigmoid(y_pred)
-
-    if weights is None:
-        weights = 1
-        weights_sum = 1
-
-    nominator = 2 * tf.reduce_sum(weights * y_true * y_pred, axis=(1, 2)) / weights_sum
-    denominator = tf.reduce_sum(weights * (y_true + y_pred), axis=(1, 2)) / weights_sum
-
-    return 1 - (nominator + 1) / (denominator + 1)
 
 
 def weak_loss(y_true, y_pred):
@@ -181,9 +58,15 @@ def mask_edges(masks):
     """
     Return mask of widen edges
     """
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (17, 17))
+    kernel_size = 17
+    shape = tf.shape(masks)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
     filters = tf.convert_to_tensor(kernel, masks.dtype)
-    filters = tf.expand_dims(filters, axis=-1)
+    filters = tf.expand_dims(filters, axis=-1) * tf.ones((kernel_size, kernel_size, shape[-1]), tf.float32)
+
+    # invert borders to create an edge
+    masks = tf.concat([1 - masks[:, :1, ...], masks[:, 1:-1, ...], 1 - masks[:, -1:, ...]], axis=1)
+    masks = tf.concat([1 - masks[..., :1, :], masks[..., 1:-1, :], 1 - masks[..., -1:, :]], axis=2)
 
     eroded = tf.nn.erosion2d(
         masks,
@@ -205,51 +88,63 @@ def mask_edges(masks):
     return dilated - eroded
 
 
-def supervised_loss(y_true, y_pred):
+def boosted_edges_loss(detections, predictions):
     """
-    Supervised loss
+    Computes loss with boosted mask edges
     """
-    # TODO: water and grass not yet implemented
-    y_true = y_true[..., :1]
-    y_pred = y_pred[..., :1]
+    # edges
+    edge_weight = tf.random.uniform((1, 1, 1, 3), 1, 40)
+    edges = mask_edges(detections)
 
-    eps = 1e-6
+    # weights
+    weights = 1 + (edge_weight - 1) * edges
+    weights = weights / tf.reduce_sum(weights, axis=(1, 2), keepdims=True)
 
-    y_true = tf.cast(y_true, tf.float32)
-
-    # area masks
-    edges = mask_edges(y_true)
-    positive = (1 - edges) * y_true
-    negative = (1 - edges) * (1 - y_true)
-
-    # area weights
-    edge_coef = 4
-    shape = tf.shape(y_true)
-    area_sum = tf.cast(shape[1] * shape[2], tf.float32)
-    pos_ratio = tf.reduce_sum(positive, axis=(1, 2), keepdims=True) / area_sum
-    neg_ratio = tf.reduce_sum(negative, axis=(1, 2), keepdims=True) / area_sum
-    edge_ratio = 1 / edge_coef * tf.reduce_sum(edges, axis=(1, 2), keepdims=True) / area_sum
-
-    pos_weight = (1 + eps) / (pos_ratio + eps)
-    neg_weight = (1 + eps) / (neg_ratio + eps)
-    edge_weight = (1 + eps) / (edge_ratio + eps)
-
-    # combine weights
-    weights = pos_weight * positive + neg_weight * negative + edge_weight * edges
-    weights_sum = tf.reduce_sum(weights, axis=(1, 2), keepdims=True)
-
-    # cross entropy
-    cross_entropy = tf.nn.sigmoid_cross_entropy_with_logits(y_true, y_pred)
-    cross_entropy = tf.reduce_sum(weights * cross_entropy, axis=(1, 2)) / weights_sum
-
-    return cross_entropy
-
-
-def zero_loss(y_true, y_pred):
     """
-    Dummy loss
+    import matplotlib.pyplot as plt
+    plt.figure()
+    plt.imshow(weights[0, ..., 0])
+    plt.colorbar()
+    plt.show()
     """
-    return 0.0 * y_pred
+
+    # loss
+    loss = tf.where(detections == 1, tf.maximum(0.0,  1 - predictions) ** 2, tf.maximum(0.0, predictions) ** 2)
+    loss = tf.reduce_sum(weights * loss, axis=(1, 2))
+
+    return loss
+
+
+class Loss(tf.keras.layers.Layer):
+    """
+    Loss layer
+    """
+
+    def build(self, input_shapes):
+        """
+        Create variables
+        """
+        self.logvars = self.add_weight(shape=(1, input_shapes[-1]), initializer=tf.constant_initializer(value=-3), name='logvars', trainable=True)
+
+
+    def call(self, in_masks, in_detections, p_detections):
+        """
+        Compute losses
+        """
+        raw_losses = boosted_edges_loss(in_detections, p_detections)
+        losses = tf.math.exp(-self.logvars) * raw_losses + self.logvars
+        losses = tf.reduce_mean(in_masks * losses, axis=1)
+
+        # losses
+        self.add_loss(losses)
+
+        # metrics
+        noise = (tf.math.exp(self.logvars) ** 0.5)[0]
+        self.add_metric(noise[0], name='mv')
+        self.add_metric(noise[1], name='wv')
+        self.add_metric(noise[2], name='gv')
+
+        return p_detections
 
 
 def rgb_to_oklab(images):
@@ -319,7 +214,6 @@ def msf_block(inputs, filters, scale='same'):
                     merged[n][..., :x[n - 1].shape[-1]] + tf.image.resize(x[n - 1], (size, size)),
                     merged[n][..., x[n - 1].shape[-1]:],
                 ], axis=-1)
-                #pass  # needs padding - too slow
             else:
                 merged[n] += tf.image.resize(x[n - 1][..., :filter_count], (size, size))
         if n < scales - 1:
@@ -331,10 +225,8 @@ def msf_block(inputs, filters, scale='same'):
                     merged[n][..., :x[n + 1].shape[-1]] + tf.image.resize(x[n + 1], (size, size)),
                     merged[n][..., x[n + 1].shape[-1]:],
                 ], axis=-1)
-                #pass  # needs padding - too slow
             else:
                 merged[n] += tf.image.resize(x[n + 1][..., :filter_count], (size, size))
-
 
     for n in range(scales):
         # projection
@@ -354,73 +246,133 @@ def msf_block(inputs, filters, scale='same'):
     return x
 
 
-def msf(mode):
-    img_size = (512, 512)
-    scales = 5
-    filters = [24, 32, 64, 64, 64, 64, 64, 64]
+class Net:
+    """
+    Neural network for semantic segmentation
+    """
 
-    # input
-    inputs = layers.Input(shape=img_size + (3,), dtype=tf.float32)
+    def __init__(self, path=None):
+        """
+        Initialize net
+        """
+        self.img_size = (512, 512)
+        self.detection_count = 3  # map, water, grass
 
-    # intro
-    inputs_oklab = rgb_to_oklab(inputs)
+        self.training_model = None
+        self.production_model = None
 
-    # downscale
-    x = scales * [None]
-    size = inputs_oklab.shape[1]
-    x[0] = inputs_oklab
-    for n in range(1, scales):
-        size = size // 2
-        x[n] = tf.image.resize(inputs_oklab, (size, size))
+        if path is None:
+            self.build()
+        else:
+            self.load(path)
 
-    # encoder
-    x = msf_block(x, filters[0:scales + 0], 'down')
-    a = x
-    x = msf_block(x, filters[1:scales + 1], 'down')
-    b = x
-    x = msf_block(x, filters[2:scales + 2], 'down')
-    c = x
-    x = msf_block(x, filters[3:scales + 3], 'same')
-    x = msf_block(x, filters[3:scales + 3], 'same')
 
-    # decoder
-    x = msf_block(x, filters[3:scales + 3], 'same')
-    x = msf_block(x, filters[3:scales + 3], 'same')
-    x = msf_block(x, filters[2:scales + 2], 'same')
-    for n in range(scales):
-        x[n] += c[n]
-    x = msf_block(x, filters[1:scales + 1], 'up')
-    for n in range(scales):
-        x[n] += b[n]
-    x = msf_block(x, filters[0:scales + 0], 'up')
-    for n in range(scales):
-        x[n] += a[n]
+    def build_detector(self, in_img):
+        """
+        Build detector
+        """
+        scales = 5
+        filters = [24, 32, 64, 64, 64, 64, 128, 256]
 
-    # outputs and model
-    if mode == 'unsupervised':
-        outputs = msf_block(x, [3] + filters[0:scales - 1], 'up')[0]  # map, water, grass
-        model = tf.keras.Model(inputs, outputs, name='msf')
-        model.compile(optimizer=optimizers.Adam(), loss=unsupervised_loss)
-    elif mode == 'weak':
-        outputs = msf_block(x, [3] + filters[0:scales - 1], 'up')[0]  # map, water, grass
-        model = tf.keras.Model(inputs, outputs, name='msf')
-        model.compile(
-            optimizer=optimizers.Adam(),
-            loss=weak_loss,
-            metrics=dice_loss,
+        # intro
+        oklab = rgb_to_oklab(in_img)
+
+        # downscale features
+        x = scales * [None]
+        size = oklab.shape[1]
+        x[0] = oklab
+        for n in range(1, scales):
+            size = size // 2
+            x[n] = tf.image.resize(oklab, (size, size))
+
+        # downscale
+        x = msf_block(x, filters[0:scales + 0], 'down')
+        x = msf_block(x, filters[1:scales + 1], 'down')
+        x = msf_block(x, filters[2:scales + 2], 'down')
+
+        # body
+        x = msf_block(x, filters[3:scales + 3], 'same')
+        x = msf_block(x, filters[3:scales + 3], 'same')
+        x = msf_block(x, filters[3:scales + 3], 'same')
+        x = msf_block(x, filters[3:scales + 3], 'same')
+        x = msf_block(x, filters[3:scales + 3], 'same')
+        x = msf_block(x, filters[3:scales + 3], 'same')
+
+        # upscale
+        x = msf_block(x, filters[2:scales + 2], 'same')
+        x = msf_block(x, filters[1:scales + 1], 'up')
+        x = msf_block(x, filters[0:scales + 0], 'up')
+
+        # outputs
+        outputs = msf_block(x, [self.detection_count] + filters[0:scales - 1], 'up')[0]
+
+        return outputs
+
+
+    def build(self):
+        """
+        Create models
+        """
+        # inputs
+        in_img = layers.Input(shape=self.img_size + (3,), dtype=tf.float32, name='img')
+        in_detections = layers.Input(shape=self.img_size + (self.detection_count,), dtype=tf.float32, name='detections')
+        in_masks = layers.Input(shape=(self.detection_count,), dtype=tf.float32, name='masks')
+
+        # detector
+        p_detections = self.build_detector(in_img)
+
+        # model for production
+        self.production_model = tf.keras.Model(
+            name='detector',
+            inputs=[in_img],
+            outputs=[p_detections],
         )
-    elif mode == 'supervised':
-        outputs = msf_block(x, [3] + filters[0:scales - 1], 'up')[0]  # map, water, grass
-        model = tf.keras.Model(inputs, outputs, name='msf')
-        model.compile(
-            optimizer=optimizers.Adam(),
-            loss=supervised_loss,
-            metrics=dice_loss,
-        )
-    else:
-        assert False, f'unknown mode {mode}'
 
-    return model
+        # losses
+        p_detections = self.production_model(in_img)
+        p_detections = Loss()(in_masks, in_detections, p_detections)
+
+        # model for training
+        self.training_model = tf.keras.Model(
+            name='training_model',
+            inputs=[in_img, in_masks, in_detections],
+            outputs=[p_detections],
+        )
+
+        # optimizer
+        self.training_model.compile(optimizer=tf.keras.optimizers.Adam(0.001))
+
+
+    def predict(self, inputs):
+        """
+        Predict outputs
+        """
+        return self.production_model.predict_on_batch(inputs)
+
+
+    def eval(self, inputs, outputs):
+        """
+        Evaluate inputs
+        """
+        return self.training_model.test_on_batch(inputs, outputs)
+
+
+    def save(self, path):
+        """
+        Save model to file
+        """
+        self.training_model.save(path, save_format='tf')
+
+
+    def load(self, path):
+        """
+        Load model from saved file
+        """
+        self.training_model = tf.keras.models.load_model(
+            path,
+            custom_objects={'Loss': Loss},
+        )
+        self.production_model = self.training_model.get_layer('detector')
 
 
 def create_blobs(width, height, fill=0.5):
@@ -470,7 +422,7 @@ class RandAug:
             'brightness': [0.3, RandAug.augment_brightness, None],
             'sharpness': [0.9, RandAug.augment_sharpness, None],
             #'affine': [1, RandAug.augment_affine, None],
-            'blobs': [1, RandAug.augment_blobs, None],
+            #'blobs': [1, RandAug.augment_blobs, None],
             'flip': [1, RandAug.augment_flip, None],
             'rotate': [1, RandAug.augment_rotate, None],
             'noise': [0.5, RandAug.augment_noise, None],
@@ -719,26 +671,63 @@ def iterate_unsupervised(dataset_path, batch_size, shuffle=True, augment=True):
                 batch_outputs = []
 
 
-def iterate_supervised(dataset_path, batch_size, shuffle=True, augment=True):
+def dataset_info(dataset_path, masks=None):
+    """
+    Return list of files in dataset
+    """
+    if masks is None:
+        masks = {'map', 'water', 'grass'}
+    elif isinstance(masks, str):
+        masks = {masks}
+    else:
+        masks = set(masks)
+    masks.add('image')
+
+    # read dataset info
+    with open(os.path.join(dataset_path, 'info.json')) as fp:
+        info = json.load(fp)
+
+    # filter dataset
+    filtered_samples = []
+    filtered_positive = {}
+    filtered_count = {}
+    for samples in info['samples']:
+        filtered_masks = set(samples.keys()) & masks
+        if len(filtered_masks) <= 1:
+            continue
+        filtered_samples.append({mask: os.path.join(dataset_path, samples[mask][0]) for mask in filtered_masks})
+        for mask in filtered_masks:
+            filtered_positive[mask] = filtered_positive.get(mask, 0) + samples[mask][1]
+            filtered_count[mask] = filtered_count.get(mask, 0) + samples['image'][1]
+
+    return {
+        'samples': filtered_samples,
+        'positive': filtered_positive,
+        'count': filtered_count,
+    }
+
+
+def iterate_supervised(dataset_path, batch_size, shuffle=True, augment=True, masks=None):
     """
     Itearate through the whole supervised dataset
     """
-    # read dataset
-    image_paths = {}
-    for filename in os.listdir(dataset_path):
-        name, type = filename.split('_', 1)
-        image_paths.setdefault(name, {})[type] = os.path.join(dataset_path, filename)
-    samples = list(image_paths.keys())
+    # read dataset info
+    info = dataset_info(dataset_path, masks)
+    samples = info['samples']
 
-    batch_inputs = []
-    batch_outputs = []
-    while True:
+    # iterate through dataset
+    batch_images = []
+    batch_masks = []
+    batch_detections = []
+    batch_count = None
+    while batch_count is None or batch_count > 0:
+        batch_count = 0
         random.shuffle(samples)
-        for name in samples:
-            image_file = image_paths[name]['image']
-            if 'map' not in image_paths[name]:
-                continue
-            map_file = image_paths[name]['map']
+        for paths in samples:
+            image_file = paths['image']
+            map_file = paths.get('map')
+            water_file = paths.get('water')
+            grass_file = paths.get('grass')
 
             # read images
             image = Image.open(image_file)
@@ -746,34 +735,99 @@ def iterate_supervised(dataset_path, batch_size, shuffle=True, augment=True):
             image = np.asarray(image)
             width, height = image.shape[:2]
 
-            map_mask = Image.open(map_file)
-            assert map_mask.mode == 'L'
-            map_mask = np.asarray(map_mask)
+            masks = []
 
-            water_mask = np.zeros_like(map_mask)
-            grass_mask = np.zeros_like(map_mask)
+            # read map
+            if map_file is None:
+                masks.append(0)
+                map_detection = np.zeros((width, height), np.uint8)
+            else:
+                masks.append(1)
+                map_detection = Image.open(map_file)
+                assert map_detection.mode == 'L'
+                map_detection = np.asarray(map_detection)
+
+            # read water
+            if water_file is None:
+                masks.append(0)
+                water_detection = np.zeros((width, height), np.uint8)
+            else:
+                masks.append(1)
+                water_detection = Image.open(water_file)
+                assert water_detection.mode == 'L'
+                water_detection = np.asarray(water_detection)
+
+            # read grass
+            if grass_file is None:
+                masks.append(0)
+                grass_detection = np.zeros((width, height), np.uint8)
+            else:
+                masks.append(1)
+                grass_detection = Image.open(grass_file)
+                assert grass_detection.mode == 'L'
+                grass_detection = np.asarray(grass_detection)
+
+            assert map_detection.shape == (width, height)
+            assert map_detection.shape == water_detection.shape
+            assert map_detection.shape == grass_detection.shape
 
             # augment
             if augment:
                 randaug = RandAug(2)
-                augmented_image = randaug.augment('image', image)
-                map_mask = randaug.augment('mask', map_mask)
-                map_mask = (map_mask > 128).astype(np.uint8) * 255
+                image = randaug.augment('image', image)
+
+                if map_file is not None:
+                    map_detection = randaug.augment('mask', map_detection)
+                    map_detection = (map_detection >= 128).astype(np.float32)
+
+                if water_file is not None:
+                    water_detection = randaug.augment('mask', water_detection)
+                    water_detection = (water_detection >= 128).astype(np.float32)
+
+                if grass_file is not None:
+                    grass_detection = randaug.augment('mask', grass_detection)
+                    grass_detection = (grass_detection >= 128).astype(np.float32)
             else:
-                augmented_image = image
+                if map_file is not None:
+                    map_detection = map_detection.astype(np.float32) / 255
+                if water_file is not None:
+                    water_detection = water_detection.astype(np.float32) / 255
+                if grass_file is not None:
+                    grass_detection = grass_detection.astype(np.float32) / 255
 
             # add to batch
-            batch_inputs.append(augmented_image)
-            batch_outputs.append(
+            batch_images.append(image)
+            batch_masks.append(masks)
+            batch_detections.append(
                 np.concatenate([
-                    map_mask[..., np.newaxis],
-                    water_mask[..., np.newaxis],
-                    grass_mask[..., np.newaxis],
-                ], axis=-1) / 255
+                    map_detection[..., np.newaxis],
+                    water_detection[..., np.newaxis],
+                    grass_detection[..., np.newaxis],
+                ], axis=-1)
             )
 
             # yield batch
-            if len(batch_inputs) == batch_size:
-                yield np.asarray(batch_inputs), np.asarray(batch_outputs)
-                batch_inputs = []
-                batch_outputs = []
+            if len(batch_images) == batch_size:
+                zeros = np.zeros((batch_size,))
+                yield [
+                    np.asarray(batch_images),
+                    np.asarray(batch_masks),
+                    np.asarray(batch_detections),
+                ], [zeros]
+                batch_count += 1
+                batch_images = []
+                batch_masks = []
+                batch_detections = []
+
+        # yield the rest batch
+        if batch_images:
+            zeros = np.zeros((batch_size,))
+            yield [
+                np.asarray(batch_images),
+                np.asarray(batch_masks),
+                np.asarray(batch_detections),
+            ], [zeros]
+            batch_count += 1
+            batch_images = []
+            batch_masks = []
+            batch_detections = []

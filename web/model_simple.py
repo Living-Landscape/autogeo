@@ -270,3 +270,5 @@ class SimpleDetector(Detector):
         gc.collect()
         self.filter_segments()
         gc.collect()
+
+        return self.segments

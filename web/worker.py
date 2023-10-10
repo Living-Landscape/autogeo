@@ -31,6 +31,39 @@ class NoMapsFound(RuntimeError):
     pass
 
 
+def save_image(image, name, output_format, zip_file):
+    """
+    Save image according to format
+    """
+    if output_format == 'png':
+        with io.BytesIO() as image_bytes:
+            image.save(image_bytes, format='png')
+
+            # optimize output image - quantize + compress
+            try:
+                process = subprocess.Popen(['pngquant', '-'], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+                compressed_bytes = process.communicate(input=image_bytes.getvalue())[0]
+                process = subprocess.Popen(['oxipng', '--strip', 'safe', '-'], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+                compressed_bytes = process.communicate(input=compressed_bytes)[0]
+                if len(compressed_bytes) == 0:
+                    compressed_bytes = image_bytes.getvalue()
+            except Exception:
+                compressed_bytes = image_bytes.getvalue()
+
+        zip_file.writestr(f'{name}.png', compressed_bytes)
+    elif output_format == 'webp':
+        with io.BytesIO() as image_bytes:
+            image.save(image_bytes, format='webp')
+            zip_file.writestr(f'{name}.webp', image_bytes.getvalue())
+    elif output_format == 'jpg':
+        background = Image.new('RGB', image.size, (255, 255, 255))
+        segment_mask = image.getchannel('A')
+        jpg_image = Image.composite(image.convert('RGB'), background, segment_mask)
+        with io.BytesIO() as image_bytes:
+            jpg_image.save(image_bytes, format='jpeg', quality=90, optimize=True)
+            zip_file.writestr(f'{name}.jpg', image_bytes.getvalue())
+
+
 def process(job_id, detector_type, output_format):
     """
     Extract map parts
@@ -92,53 +125,55 @@ def process(job_id, detector_type, output_format):
         # extract map blobs
         if detector_type == 'simple':
             detector = SimpleDetector(image)
-            detector.detect()
+            segments, masks = detector.detect()
         elif detector_type == 'nnet':
             detector = NNetDetector('model_nnet.tflite', image)
             last_progress_update = None
-            detector.detect(progress_fn)
-        if not detector.segments:
+            segments, masks, confidence = detector.detect(progress_fn)
+        if not segments[0]:  # map mask
             raise NoMapsFound('Nepodařilo se najít žádné mapy na obrázku.')
 
         # zip with images
         with zipfile.ZipFile(result_path, 'w', zipfile.ZIP_DEFLATED) as zip_file:
-            for n, segment in enumerate(detector.segments):
-                segment_image = Image.fromarray(detector.draw_segment(segment, shrink=True))
+            map_index = 0
+            water_index = 1
+            for n, map_segment in enumerate(segments[map_index]):
+                # create image for detected map segment
+                map_image = Image.fromarray(detector.draw_segment(map_segment))
                 gc.collect()
                 if resize_ratio:
-                    segment_image = segment_image.resize((segment_image.width * resize_ratio, segment_image.height * resize_ratio), Image.BICUBIC)
+                    map_image = map_image.resize((map_image.width * resize_ratio, map_image.height * resize_ratio), Image.BICUBIC)
                     gc.collect()
 
-                # create image
-                if output_format == 'png':
-                    with io.BytesIO() as image_bytes:
-                        segment_image.save(image_bytes, format='png')
+                # write image bytes
+                save_image(map_image, f'mapa_{n + 1}', output_format, zip_file)
 
-                        # optimize output image - quantize + compress
-                        try:
-                            process = subprocess.Popen(['pngquant', '-'], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
-                            compressed_bytes = process.communicate(input=image_bytes.getvalue())[0]
-                            process = subprocess.Popen(['oxipng', '--strip', 'safe', '-'], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
-                            compressed_bytes = process.communicate(input=compressed_bytes)[0]
-                            if len(compressed_bytes) == 0:
-                                compressed_bytes = image_bytes.getvalue()
-                        except Exception:
-                            compressed_bytes = image_bytes.getvalue()
+                del map_image
+                gc.collect()
 
-                    zip_file.writestr(f'mapa_{n + 1}.png', compressed_bytes)
-                elif output_format == 'webp':
-                    with io.BytesIO() as image_bytes:
-                        segment_image.save(image_bytes, format='webp')
-                        zip_file.writestr(f'mapa_{n + 1}.webp', image_bytes.getvalue())
-                elif output_format == 'jpg':
-                    background = Image.new('RGB', segment_image.size, (255, 255, 255))
-                    segment_mask = segment_image.getchannel('A')
-                    jpg_image = Image.composite(segment_image.convert('RGB'), background, segment_mask)
-                    with io.BytesIO() as image_bytes:
-                        jpg_image.save(image_bytes, format='jpeg', quality=90, optimize=True)
-                        zip_file.writestr(f'mapa_{n + 1}.jpg', image_bytes.getvalue())
+                # find all water chunks inside current map segment
+                map_box, map_contour = map_segment
+                map_left, map_top, map_right, map_bottom = map_box
+                water_image = None
+                for water_segment in segments[water_index]:
+                    _, contour = water_segment
+                    left = np.min(contour[..., 0])
+                    right = np.max(contour[..., 0])
+                    top = np.min(contour[..., 1])
+                    bottom = np.max(contour[..., 1])
 
-                del segment_image
+                    if (
+                        map_left <= left < map_right or
+                        map_left <= right < map_right or
+                        map_top <= top < map_bottom or
+                        map_top <= bottom < map_bottom
+                    ):
+                        water_image = detector.draw_segment((map_box, contour), erase=False)
+
+                if water_image is not None:
+                    save_image(Image.fromarray(water_image), f'voda_{n + 1}', output_format, zip_file)
+
+                del water_image
                 gc.collect()
 
             # background colors

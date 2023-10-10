@@ -6,3 +6,10 @@ opencv-contrib-python
 scikit-image
 numba
 tensorflow
+
+memory_profiler
+
+tf2onnx
+deepsparse
+
+pygobject

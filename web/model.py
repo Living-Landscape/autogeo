@@ -12,17 +12,16 @@ class Detector:
 
     def __init__(self, image):
         self.image = image
-        self.image_mask = image[..., 3]
         self.image_height, self.image_width = image.shape[:2]
         self.segments = None
 
 
-    def find_segments(self):
+    def find_segments(self, mask):
         """
         Find map contours
         """
         # find blob contours
-        contours = cv2.findContours(self.image_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[0]
+        contours = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[0]
 
         # extract the biggest segments
         for contour in contours:
@@ -40,11 +39,15 @@ class Detector:
             yield (left, top, right, bottom), contour
 
 
-    def draw_segment(self, segment, shrink=False):
+    def draw_segment(self, segment, shrink=True, erase=True):
         """
         Draw segments into image
         """
         (left, top, right, bottom), contour = segment
+
+        if erase:
+            self.image[..., 3].fill(0)
+
         if shrink:
             segment_width = right - left + 1
             segment_height = bottom - top + 1
@@ -58,10 +61,9 @@ class Detector:
 
             return self.image[top:bottom + 1, left:right + 1, :]
         else:
-            mask = np.zeros_like(self.image_mask)
-            cv2.fillPoly(mask, [contour], color=255)
+            cv2.fillPoly(self.image[..., 3], [contour], color=255)
 
-            return mask
+            return self.image
 
 
     def detect(self):
