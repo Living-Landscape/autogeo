@@ -123,6 +123,9 @@ def process(job_id, detector_type, output_format):
                 last_progress_update = now
 
         # extract map blobs
+        map_index = 0
+        water_index = 1
+
         if detector_type == 'simple':
             detector = SimpleDetector(image)
             segments, masks = detector.detect()
@@ -130,13 +133,11 @@ def process(job_id, detector_type, output_format):
             detector = NNetDetector('model_nnet.tflite', image)
             last_progress_update = None
             segments, masks, confidence = detector.detect(progress_fn)
-        if not segments[0]:  # map mask
+        if not segments[map_index]:  # map mask
             raise NoMapsFound('Nepodařilo se najít žádné mapy na obrázku.')
 
         # zip with images
         with zipfile.ZipFile(result_path, 'w', zipfile.ZIP_DEFLATED) as zip_file:
-            map_index = 0
-            water_index = 1
             for n, map_segment in enumerate(segments[map_index]):
                 # create image for detected map segment
                 map_image = Image.fromarray(detector.draw_segment(map_segment))
@@ -163,12 +164,10 @@ def process(job_id, detector_type, output_format):
                     bottom = np.max(contour[..., 1])
 
                     if (
-                        map_left <= left < map_right or
-                        map_left <= right < map_right or
-                        map_top <= top < map_bottom or
-                        map_top <= bottom < map_bottom
+                        (map_left <= left < map_right or map_left <= right < map_right) and
+                        (map_top <= top < map_bottom or map_top <= bottom < map_bottom)
                     ):
-                        water_image = detector.draw_segment((map_box, contour), erase=False)
+                        water_image = detector.draw_segment((map_box, contour), erase=water_image is None)
 
                 if water_image is not None:
                     save_image(Image.fromarray(water_image), f'voda_{n + 1}', output_format, zip_file)

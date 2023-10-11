@@ -25,7 +25,7 @@ def prediction_confidence(predictions, thresholds):
 class TFLiteModel:
 
     def __init__(self, path):
-        self.thresholds = (0.79, 0.68, 0.5)
+        self.thresholds = (0.56, 0.41, 0.5)
 
         self.interpreter = tflite.Interpreter(model_path=path)
         self.interpreter.allocate_tensors()
@@ -126,15 +126,19 @@ class NNetDetector(Detector):
         topn = int(iterations / 20)
         confidence = np.mean(np.sort(confidences, axis=0)[:topn], axis=0)
 
+        min_map_ratio = 20
+        min_water_ratio = 200
+        min_grass_ratio = 1
+
         # post-processing maps
         masks[..., 0] = ndimage.binary_fill_holes(masks[..., 0])
         masks[..., 0] = masks[..., 0].astype(np.uint8)
         masks[..., 0] = remove_thin_structures(masks[..., 0])
 
-        # post-processing water
-        masks[..., 1] = remove_thin_structures(masks[..., 1])
-
         # find map segments
-        segments = [list(self.find_segments(masks[..., n])) for n in range(3)]
+        segments = [
+            list(self.find_segments(masks[..., n], min_area_ratio))
+            for n, min_area_ratio in enumerate([min_map_ratio, min_water_ratio, min_grass_ratio])
+        ]
 
         return segments, masks, confidence

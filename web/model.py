@@ -16,7 +16,7 @@ class Detector:
         self.segments = None
 
 
-    def find_segments(self, mask):
+    def find_segments(self, mask, min_area_ratio):
         """
         Find map contours
         """
@@ -26,7 +26,7 @@ class Detector:
         # extract the biggest segments
         for contour in contours:
             # check area
-            min_dimension = np.sqrt(self.image_width * self.image_height) / 20
+            min_dimension = np.sqrt(self.image_width * self.image_height) / min_area_ratio
             area = cv2.contourArea(contour)
             if area < min_dimension ** 2:
                 continue
@@ -57,7 +57,10 @@ class Detector:
             ), dtype=np.uint8)
 
             cv2.fillPoly(mask, [contour - [(left, top)]], color=255)
-            self.image[top:bottom + 1, left:right + 1, 3] = mask
+            self.image[top:bottom + 1, left:right + 1, 3] = np.maximum(
+                mask,
+                self.image[top:bottom + 1, left:right + 1, 3],
+            )
 
             return self.image[top:bottom + 1, left:right + 1, :]
         else:
