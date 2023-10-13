@@ -13,6 +13,7 @@ from redis import Redis
 from rq.job import Job
 from PIL import Image
 import numpy as np
+import cv2
 
 from model_simple import SimpleDetector
 from model_nnet import NNetDetector
@@ -37,6 +38,7 @@ def save_image(image, name, output_format, zip_file):
     """
     if output_format == 'png':
         with io.BytesIO() as image_bytes:
+            image = Image.fromarray(image)
             image.save(image_bytes, format='png')
 
             # optimize output image - quantize + compress
@@ -53,14 +55,16 @@ def save_image(image, name, output_format, zip_file):
         zip_file.writestr(f'{name}.png', compressed_bytes)
     elif output_format == 'webp':
         with io.BytesIO() as image_bytes:
+            image = Image.fromarray(image)
             image.save(image_bytes, format='webp')
             zip_file.writestr(f'{name}.webp', image_bytes.getvalue())
     elif output_format == 'jpg':
-        background = Image.new('RGB', image.size, (255, 255, 255))
-        segment_mask = image.getchannel('A')
-        jpg_image = Image.composite(image.convert('RGB'), background, segment_mask)
+        background = np.asarray([[(255, 255, 255)]], dtype=np.uint8)
+        image = np.where(image[..., 3:] == 255, image[..., :3], background)
+        image = Image.fromarray(image)
+        #image = numpy_to_pil(image[..., :3], 'RGB')
         with io.BytesIO() as image_bytes:
-            jpg_image.save(image_bytes, format='jpeg', quality=90, optimize=True)
+            image.save(image_bytes, format='jpeg', quality=90, optimize=True)
             zip_file.writestr(f'{name}.jpg', image_bytes.getvalue())
 
 
@@ -80,15 +84,16 @@ def process(job_id, detector_type, output_format):
         # decode image
         try:
             image = Image.open(job_path)
+            image_width = image.width
+            image_height = image.height
         except Exception:
             raise RuntimeError('Nedokážu přečíst nahrávaný soubor, zpracuju jenom .png a .jpg obrázky.')
-        gc.collect()
 
         # check image mode
         if image.mode == 'L':
             raise RuntimeError('Čekal jsem barevný obrázek, ne šedivý')
         elif image.mode == 'RGB':
-            image.putalpha(255)
+            pass
         elif image.mode == 'RGBA':
             pass
         else:
@@ -102,9 +107,12 @@ def process(job_id, detector_type, output_format):
             resize_ratio = 2
         else:
             resize_ratio = None
-        if resize_ratio:
+        if resize_ratio is not None:
             image = image.resize((image.width // resize_ratio, image.height // resize_ratio), Image.BICUBIC)
-            gc.collect()
+
+        # add transparency if necessary
+        if image.mode == 'RGB':
+            image.putalpha(255)
 
         # convert to numpy
         image = np.array(image, dtype=np.uint8)
@@ -140,13 +148,11 @@ def process(job_id, detector_type, output_format):
         with zipfile.ZipFile(result_path, 'w', zipfile.ZIP_DEFLATED) as zip_file:
             for n, map_segment in enumerate(segments[map_index]):
                 # create image for detected map segment
-                map_image = Image.fromarray(detector.draw_segment(map_segment))
-                gc.collect()
-                if resize_ratio:
-                    map_image = map_image.resize((map_image.width * resize_ratio, map_image.height * resize_ratio), Image.BICUBIC)
-                    gc.collect()
+                map_image = detector.draw_segment(map_segment)
+                if resize_ratio is not None:
+                    map_image = cv2.resize(map_image, (image_width, image_height), interpolation=cv2.INTER_CUBIC)
 
-                # write image bytes
+                # write map image
                 save_image(map_image, f'mapa_{n + 1}', output_format, zip_file)
 
                 del map_image
@@ -169,8 +175,11 @@ def process(job_id, detector_type, output_format):
                     ):
                         water_image = detector.draw_segment((map_box, contour), erase=water_image is None)
 
+                # write water image
                 if water_image is not None:
-                    save_image(Image.fromarray(water_image), f'voda_{n + 1}', output_format, zip_file)
+                    if resize_ratio:
+                        water_image = cv2.resize(water_image, (image_width, image_height), interpolation=cv2.INTER_CUBIC)
+                    save_image(water_image, f'voda_{n + 1}', output_format, zip_file)
 
                 del water_image
                 gc.collect()
@@ -184,6 +193,7 @@ def process(job_id, detector_type, output_format):
                     for b in range(250, 256)
                 )
                 zip_file.writestr('pozadi.txt', background_colors)
+
         del detector
         del image
         gc.collect()
