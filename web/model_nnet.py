@@ -123,7 +123,7 @@ class NNetDetector(Detector):
         masks = masks / counts
         masks = masks > self.model.thresholds
         masks = masks.astype(np.uint8)
-        topn = int(iterations / 20)
+        topn = max(1, int(iterations / 20))
         confidence = np.mean(np.sort(confidences, axis=0)[:topn], axis=0)
 
         min_map_ratio = 20
