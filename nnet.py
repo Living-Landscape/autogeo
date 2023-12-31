@@ -375,12 +375,14 @@ class Net:
         self.production_model = self.training_model.get_layer('detector')
 
 
-def create_blobs(width, height, fill=0.5):
+def create_blobs(width, height, fill=0.5, seed=None):
     """
     Create blob mask
     """
+    generator = np.random.default_rng(seed=seed)
+
     # create random noise image
-    noise = np.random.randint(0, 255, (height, width), np.uint8)
+    noise = generator.integers(0, 255, (height, width), np.uint8)
 
     # blur the noise image to control the size
     blur = cv2.GaussianBlur(noise, (0,0), sigmaX=4, sigmaY=4, borderType=cv2.BORDER_DEFAULT)
@@ -618,70 +620,16 @@ class RandAug:
         return image
 
 
-def iterate_unsupervised(dataset_path, batch_size, shuffle=True, augment=True):
-    """
-    Itearate through the whole unsupervised dataset
-    """
-    # read dataset
-    image_paths = {}
-    for filename in os.listdir(dataset_path):
-        name, type = filename.split('_', 1)
-        image_paths.setdefault(name, {})[type] = os.path.join(dataset_path, filename)
-    samples = list(image_paths.keys())
-
-    transforms = {
-        'blobs': 0,
-    }
-
-    batch_inputs = []
-    batch_outputs = []
-    while True:
-        random.shuffle(samples)
-        for name in samples:
-            image_file = image_paths[name]['image']
-
-            # read image
-            image = Image.open(image_file)
-            assert image.mode == 'RGB'
-            image = np.asarray(image)
-            width, height = image.shape[:2]
-
-            # augment
-            if augment:
-                randaug = RandAug(2, transforms)
-                preserved_image = randaug.augment('preserve_features', image)
-                augmented_image = randaug.augment('image', image)
-            else:
-                preserved_image = image
-                augmented_image = image
-
-            blob_mask = create_blobs(*image.shape[:2], fill=0.75)[..., np.newaxis]
-            noise = np.random.randint(0, 255, image.shape)
-            masked_image = blob_mask * noise + (1 - blob_mask) * augmented_image
-            masked_image = masked_image.astype(np.uint8)
-
-            # add to batch
-            batch_inputs.append(masked_image)
-            batch_outputs.append(preserved_image / 255.0)
-
-            # yield batch
-            if len(batch_inputs) == batch_size:
-                yield np.asarray(batch_inputs), np.asarray(batch_outputs)
-                batch_inputs = []
-                batch_outputs = []
-
-
-def dataset_info(dataset_path, masks=None):
+def dataset_info(dataset_path, types):
     """
     Return list of files in dataset
     """
-    if masks is None:
-        masks = {'map', 'water', 'grass'}
-    elif isinstance(masks, str):
-        masks = {masks}
+    assert types is not None
+
+    if isinstance(types, str):
+        types = {types}
     else:
-        masks = set(masks)
-    masks.add('image')
+        types = set(types)
 
     # read dataset info
     with open(os.path.join(dataset_path, 'info.json')) as fp:
@@ -689,40 +637,105 @@ def dataset_info(dataset_path, masks=None):
 
     # filter dataset
     filtered_samples = []
-    filtered_positive = {}
-    filtered_count = {}
+    filtered_counts = {}
     for samples in info['samples']:
-        filtered_masks = set(samples.keys()) & masks
-        if len(filtered_masks) <= 1:
+        filtered_types = set(samples.keys()) & types
+        if len(filtered_types) <= 1:
             continue
-        filtered_samples.append({mask: os.path.join(dataset_path, samples[mask][0]) for mask in filtered_masks})
-        for mask in filtered_masks:
-            filtered_positive[mask] = filtered_positive.get(mask, 0) + samples[mask][1]
-            filtered_count[mask] = filtered_count.get(mask, 0) + samples['image'][1]
+        filtered_samples.append({types: os.path.join(dataset_path, samples[types][0]) for types in filtered_types})
+        for current_type in filtered_types:
+            filtered_counts[current_type] = filtered_counts.get(current_type, 0) + 1
 
     return {
         'samples': filtered_samples,
-        'positive': filtered_positive,
-        'count': filtered_count,
+        'counts': filtered_counts,
     }
 
 
-def iterate_supervised(dataset_path, batch_size, shuffle=True, augment=True, masks=None):
+def iterate_unsupervised(dataset_path, batch_size, shuffle=True, augment=True):
+    """
+    Itearate through the whole unsupervised dataset
+    """
+    # read dataset
+    info = dataset_info(dataset_path, {'image', 'warp'})
+    samples = info['samples']
+
+    batch_images = []
+    batch_blobs = []
+    while True:
+        if shuffle:
+            random.shuffle(samples)
+        for paths in samples:
+            image_file = paths['image']
+            warp_file = paths['warp']
+
+            # read image
+            image = Image.open(image_file)
+            assert image.mode == 'RGB'
+            image = np.asarray(image)
+            width, height = image.shape[:2]
+
+            # read warped mask
+            warp = Image.open(warp_file)
+            assert warp.mode == 'L'
+            warp = np.asarray(warp)
+
+            # augment
+            if augment:
+                randaug = RandAug(2)
+                image = randaug.augment('image', image)
+                warp = randaug.augment('mask', warp)
+                seed = None
+            else:
+                seed = hash(image.data)
+
+            # create masking blobs
+            warp = warp[..., np.newaxis]
+            blob_mask = create_blobs(*image.shape[:2], fill=0.75, seed=seed)[..., np.newaxis]
+            blob_mask = np.minimum(blob_mask, warp)
+
+            # add to batch
+            batch_images.append(image)
+            batch_blobs.append(blob_mask)
+
+            # yield batch
+            if len(batch_images) == batch_size:
+                zeros = np.zeros((batch_size,))
+                yield [
+                    np.asarray(batch_images),
+                    np.asarray(batch_blobs),
+                ], [zeros]
+                batch_images = []
+                batch_blobs = []
+
+        # yield the restbatch
+        if batch_images:
+            zeros = np.zeros((batch_size,))
+            yield [
+                np.asarray(batch_images),
+                np.asarray(batch_blobs),
+            ], [zeros]
+            batch_images = []
+            batch_blobs = []
+
+
+def iterate_supervised(dataset_path, batch_size, masks, shuffle=True, augment=True):
     """
     Itearate through the whole supervised dataset
     """
+    assert masks is not None
+
     # read dataset info
-    info = dataset_info(dataset_path, masks)
+    info = dataset_info(dataset_path, set(masks) | {'image'})
     samples = info['samples']
 
     # iterate through dataset
     batch_images = []
     batch_masks = []
     batch_detections = []
-    batch_count = None
-    while batch_count is None or batch_count > 0:
-        batch_count = 0
-        random.shuffle(samples)
+    while True:
+        if shuffle:
+            random.shuffle(samples)
         for paths in samples:
             image_file = paths['image']
             map_file = paths.get('map')
@@ -814,7 +827,6 @@ def iterate_supervised(dataset_path, batch_size, shuffle=True, augment=True, mas
                     np.asarray(batch_masks),
                     np.asarray(batch_detections),
                 ], [zeros]
-                batch_count += 1
                 batch_images = []
                 batch_masks = []
                 batch_detections = []
@@ -827,7 +839,6 @@ def iterate_supervised(dataset_path, batch_size, shuffle=True, augment=True, mas
                 np.asarray(batch_masks),
                 np.asarray(batch_detections),
             ], [zeros]
-            batch_count += 1
             batch_images = []
             batch_masks = []
             batch_detections = []
