@@ -3,8 +3,8 @@
 Project aims to automatically georeference "Císařské otisky" from https://ags.cuzk.cz/archiv/. The process is multistage and in progress. The result will be the web service where an users can georeference their own maps.
 
  * [x] web service with task queues
- * [x] strip down maps background with simple or neural network model
- * [x] map output in png, jpg or webp
+ * [x] segmentation of maps, water and meadows
+ * [x] output in png, jpg or webp
  * [ ] actual georeferencing
 
 ## Installation

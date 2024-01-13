@@ -10,50 +10,6 @@ from tensorflow.keras import layers
 from PIL import Image, ImageEnhance, ImageOps
 
 
-def unsupervised_loss(y_true, y_pred):
-    """
-    Weighted L1 loss
-    """
-    y_true = tf.cast(y_true, tf.float32)
-
-    #l1 = tf.abs(y_true - y_pred)
-    #weights = compute_image_weights(y_true)
-
-    #return tf.reduce_mean(l1 * weights, axis=(1, 2))
-
-    l1 = tf.reduce_sum(tf.abs(y_true - y_pred), axis=-1)
-    return tf.reduce_mean(l1, axis=(1, 2))
-
-
-def weak_loss(y_true, y_pred):
-    """
-    Combined dice and cross entropy loss
-    """
-    # TODO: water and grass not yet implemented
-    y_true = y_true[..., :1]
-    y_pred = y_pred[..., :1]
-    eps = 1e-6
-
-    y_true = tf.cast(y_true, tf.float32)
-
-    # pixel weights
-    positive = y_true
-    negative = (1 - y_true)
-
-    shape = tf.shape(y_true)
-    all_sum = tf.cast(shape[0] * shape[1] * shape[2], tf.float32)
-    pos_weight = tf.reduce_sum(positive, axis=(0, 1, 2), keepdims=True) / all_sum
-    neg_weight = tf.reduce_sum(negative, axis=(0, 1, 2), keepdims=True) / all_sum
-    weights = eps + (1 - pos_weight) * positive + (1 - neg_weight) * negative
-    weights_sum = tf.reduce_sum(weights, axis=(0, 1, 2))
-
-    # cross entropy
-    cross_entropy = tf.nn.sigmoid_cross_entropy_with_logits(y_true, y_pred)
-    cross_entropy = tf.reduce_sum(weights * cross_entropy, axis=(0, 1, 2)) / weights_sum
-
-    return cross_entropy
-
-
 def mask_edges(masks):
     """
     Return mask of widen edges
@@ -115,9 +71,35 @@ def boosted_edges_loss(detections, predictions):
     return loss
 
 
-class Loss(tf.keras.layers.Layer):
+class BlendedLoss(tf.keras.layers.Layer):
     """
-    Loss layer
+    Loss layer, computes reconstruction loss for blended images
+    """
+
+    def build(self, input_shapes):
+        """
+        Create variables
+        """
+        pass
+
+
+    def call(self, in_blended, in_a, in_b, p_reconstruction):
+        """
+        Compute losses
+        """
+        # dominant losss
+        l1_a = tf.reduce_mean(tf.abs(in_a / 255 - p_reconstruction), axis=(1, 2))
+        l1_a = tf.reduce_mean(l1_a, axis=1)
+
+        # losses
+        self.add_loss(l1_a)
+
+        return p_reconstruction
+
+
+class SegmentationLoss(tf.keras.layers.Layer):
+    """
+    Loss layer, l2 segmentation loss
     """
 
     def build(self, input_shapes):
@@ -246,33 +228,34 @@ def msf_block(inputs, filters, scale='same'):
     return x
 
 
-class Net:
+class EncoderNN:
     """
-    Neural network for semantic segmentation
+    Encoder for NN
     """
 
-    def __init__(self, path=None):
+    def __init__(self, model=None):
         """
         Initialize net
         """
         self.img_size = (512, 512)
-        self.detection_count = 3  # map, water, grass
+        self.scales = 5
+        self.filters = [24, 32, 64, 64, 64, 64, 128, 256]
 
-        self.training_model = None
-        self.production_model = None
-
-        if path is None:
-            self.build()
+        if model is None:
+            self.model = self.build()
         else:
-            self.load(path)
+            self.model = model
 
 
-    def build_detector(self, in_img):
+    def build(self):
         """
-        Build detector
+        Build encoder
         """
-        scales = 5
-        filters = [24, 32, 64, 64, 64, 64, 128, 256]
+        scales = self.scales
+        filters = self.filters
+
+        # inputs
+        in_img = layers.Input(shape=self.img_size + (3,), dtype=tf.float32, name='img')
 
         # intro
         oklab = rgb_to_oklab(in_img)
@@ -297,49 +280,83 @@ class Net:
         x = msf_block(x, filters[3:scales + 3], 'same')
         x = msf_block(x, filters[3:scales + 3], 'same')
         x = msf_block(x, filters[3:scales + 3], 'same')
+        x = msf_block(x, filters[2:scales + 2], 'same')
 
         # upscale
-        x = msf_block(x, filters[2:scales + 2], 'same')
         x = msf_block(x, filters[1:scales + 1], 'up')
         x = msf_block(x, filters[0:scales + 0], 'up')
 
-        # outputs
-        outputs = msf_block(x, [self.detection_count] + filters[0:scales - 1], 'up')[0]
-
-        return outputs
-
-
-    def build(self):
-        """
-        Create models
-        """
-        # inputs
-        in_img = layers.Input(shape=self.img_size + (3,), dtype=tf.float32, name='img')
-        in_detections = layers.Input(shape=self.img_size + (self.detection_count,), dtype=tf.float32, name='detections')
-        in_masks = layers.Input(shape=(self.detection_count,), dtype=tf.float32, name='masks')
-
-        # detector
-        p_detections = self.build_detector(in_img)
-
-        # model for production
-        self.production_model = tf.keras.Model(
-            name='detector',
+        # encoder
+        self.model = tf.keras.Model(
+            name='encoder',
             inputs=[in_img],
-            outputs=[p_detections],
+            outputs=[x],
         )
 
+        return self.model
+
+
+class UnsupervisedNN:
+    """
+    Unsupervised NN, reconstruction
+    """
+    def __init__(self, path=None):
+        """
+        Initialize net
+        """
+        self.model = None
+        self.training_model = None
+
+        # create / load model
+        if path is None:
+            self.build_training(EncoderNN())
+        else:
+            self.load(path)
+
+
+    def build_model(self, encoder, in_img):
+        """
+        Build detector
+        """
+        # add detection head
+        scales = encoder.scales
+        filters = encoder.filters
+        embedding =  encoder.model(in_img)[0]
+        reconstruction = msf_block(embedding, [3] + filters[0:scales - 1], 'up')[0]
+
+        return tf.keras.Model(
+            name='unsupervised_model',
+            inputs=[in_img],
+            outputs=[reconstruction],
+        )
+
+
+    def build_training(self, encoder):
+        """
+        Build training models
+        """
+        # inputs
+        in_blended = layers.Input(shape=encoder.img_size + (3,), dtype=tf.float32, name='combined_image')
+        in_a = layers.Input(shape=encoder.img_size + (3,), dtype=tf.float32, name='a_image')
+        in_b = layers.Input(shape=encoder.img_size + (3,), dtype=tf.float32, name='b_image')
+
+        # models
+        self.model = self.build_model(encoder, in_blended)
+
+        # outputs
+        p_reconstruction = self.model(in_blended)
+
         # losses
-        p_detections = self.production_model(in_img)
-        p_detections = Loss()(in_masks, in_detections, p_detections)
+        p_unsupervised = BlendedLoss()(in_blended, in_a, in_b, p_reconstruction)
 
         # model for training
         self.training_model = tf.keras.Model(
             name='training_model',
-            inputs=[in_img, in_masks, in_detections],
-            outputs=[p_detections],
+            inputs=[in_blended, in_a, in_b],
+            outputs=[p_unsupervised],
         )
 
-        # optimizer
+        # unsupervised optimizer
         self.training_model.compile(optimizer=tf.keras.optimizers.Adam(0.001))
 
 
@@ -347,7 +364,7 @@ class Net:
         """
         Predict outputs
         """
-        return self.production_model.predict_on_batch(inputs)
+        return self.model.predict_on_batch(inputs)
 
 
     def eval(self, inputs, outputs):
@@ -370,9 +387,126 @@ class Net:
         """
         self.training_model = tf.keras.models.load_model(
             path,
-            custom_objects={'Loss': Loss},
+            custom_objects={'BlendedLoss': BlendedLoss},
         )
-        self.production_model = self.training_model.get_layer('detector')
+        self.model = self.training_model.get_layer('unsupervised_model')
+
+
+class DetectorNN:
+    """
+    Detector NN, semantic segmentation
+    """
+    def __init__(self, load=None):
+        """
+        Initialize net
+        """
+        self.detection_count = 3  # map, water, wet meadow
+
+        self.model = None
+        self.training_model = None
+
+        # create / load model
+        if load is None:
+            self.build_training(EncoderNN())
+        else:
+            model_type, path = load
+            if model_type == 'detector':
+                self.load(path)
+            elif model_type == 'unsupervised':
+                self.load_unsupervised(path)
+            else:
+                assert False
+
+
+    def build_model(self, encoder, in_img):
+        """
+        Build detector
+        """
+        # add detection head
+        scales = encoder.scales
+        filters = encoder.filters
+        embedding =  encoder.model(in_img)[0]
+        detections = msf_block(embedding, [self.detection_count] + filters[0:scales - 1], 'up')[0]
+
+        return tf.keras.Model(
+            name='detector',
+            inputs=[in_img],
+            outputs=[detections],
+        )
+
+
+    def build_training(self, encoder):
+        """
+        Create training models
+        """
+        # inputs
+        in_img = layers.Input(shape=encoder.img_size + (3,), dtype=tf.float32, name='img')
+        in_detections = layers.Input(shape=encoder.img_size + (self.detection_count,), dtype=tf.float32, name='detections')
+        in_masks = layers.Input(shape=(self.detection_count,), dtype=tf.float32, name='masks')
+
+        # models
+        self.model = self.build_model(encoder, in_img)
+
+        # outputs
+        p_detections = self.model(in_img)
+
+        # losses
+        p_detections = SegmentationLoss()(in_masks, in_detections, p_detections)
+
+        # model for training
+        self.training_model = tf.keras.Model(
+            name='training_model',
+            inputs=[in_img, in_masks, in_detections],
+            outputs=[p_detections],
+        )
+
+        # optimizer
+        self.training_model.compile(optimizer=tf.keras.optimizers.Adam(0.001))
+
+
+    def predict(self, inputs):
+        """
+        Predict outputs
+        """
+        return self.model.predict_on_batch(inputs)
+
+
+    def eval(self, inputs, outputs):
+        """
+        Evaluate inputs
+        """
+        return self.training_model.test_on_batch(inputs, outputs)
+
+
+    def save(self, path):
+        """
+        Save model to file
+        """
+        self.training_model.save(path, save_format='tf')
+
+
+    def load(self, path):
+        """
+        Load model from saved file
+        """
+        self.training_model = tf.keras.models.load_model(
+            path,
+            custom_objects={'SegmentationLoss': SegmentationLoss},
+        )
+        self.model = self.training_model.get_layer('detector')
+
+
+    def load_unsupervised(self, path):
+        """
+        Load from unsupervised model file
+        """
+        training_model = tf.keras.models.load_model(
+            path,
+            custom_objects={'BlendedLoss': BlendedLoss},
+        )
+        unsupervised_model = training_model.get_layer('unsupervised_model')
+        encoder = EncoderNN(unsupervised_model.get_layer('encoder'))
+        self.build_training(encoder)
 
 
 def create_blobs(width, height, fill=0.5, seed=None):
@@ -640,7 +774,7 @@ def dataset_info(dataset_path, types):
     filtered_counts = {}
     for samples in info['samples']:
         filtered_types = set(samples.keys()) & types
-        if len(filtered_types) <= 1:
+        if not filtered_types:
             continue
         filtered_samples.append({types: os.path.join(dataset_path, samples[types][0]) for types in filtered_types})
         for current_type in filtered_types:
@@ -652,22 +786,51 @@ def dataset_info(dataset_path, types):
     }
 
 
+def blend_images(batch_images):
+    """
+    Blend images
+    """
+    batch_a = []
+    batch_b = []
+    batch_blended = []
+    bs = len(batch_images)
+    for n in range(bs // 2):
+        image_a = batch_images[n]
+        image_b = batch_images[bs // 2 + n]
+
+        # a dominant
+        alpha = 0.7 + np.random.random() * 0.1
+        image_blended = alpha * image_a + (1 - alpha) * image_b
+        image_blended = image_blended.astype(np.uint8)
+        batch_a.append(image_a)
+        batch_b.append(image_b)
+        batch_blended.append(image_blended)
+
+        # b dominant
+        alpha = 0.7 + np.random.random() * 0.1
+        image_blended = alpha * image_b + (1 - alpha) * image_a
+        image_blended = image_blended.astype(np.uint8)
+        batch_a.append(image_b)
+        batch_b.append(image_a)
+        batch_blended.append(image_blended)
+
+    return batch_blended, batch_a, batch_b
+
+
 def iterate_unsupervised(dataset_path, batch_size, shuffle=True, augment=True):
     """
     Itearate through the whole unsupervised dataset
     """
     # read dataset
-    info = dataset_info(dataset_path, {'image', 'warp'})
+    info = dataset_info(dataset_path, {'image'})
     samples = info['samples']
 
     batch_images = []
-    batch_blobs = []
     while True:
         if shuffle:
             random.shuffle(samples)
         for paths in samples:
             image_file = paths['image']
-            warp_file = paths['warp']
 
             # read image
             image = Image.open(image_file)
@@ -675,48 +838,34 @@ def iterate_unsupervised(dataset_path, batch_size, shuffle=True, augment=True):
             image = np.asarray(image)
             width, height = image.shape[:2]
 
-            # read warped mask
-            warp = Image.open(warp_file)
-            assert warp.mode == 'L'
-            warp = np.asarray(warp)
-
             # augment
             if augment:
                 randaug = RandAug(2)
                 image = randaug.augment('image', image)
-                warp = randaug.augment('mask', warp)
-                seed = None
-            else:
-                seed = hash(image.data)
 
-            # create masking blobs
-            warp = warp[..., np.newaxis]
-            blob_mask = create_blobs(*image.shape[:2], fill=0.75, seed=seed)[..., np.newaxis]
-            blob_mask = np.minimum(blob_mask, warp)
-
-            # add to batch
             batch_images.append(image)
-            batch_blobs.append(blob_mask)
 
             # yield batch
-            if len(batch_images) == batch_size:
+            if len(batch_images) ==  batch_size:
+                batch_blended, batch_a, batch_b = blend_images(batch_images)
                 zeros = np.zeros((batch_size,))
                 yield [
-                    np.asarray(batch_images),
-                    np.asarray(batch_blobs),
+                    np.asarray(batch_blended),
+                    np.asarray(batch_a),
+                    np.asarray(batch_b),
                 ], [zeros]
                 batch_images = []
-                batch_blobs = []
 
         # yield the restbatch
         if batch_images:
+            batch_blended, batch_a, batch_b = blend_images(batch_images)
             zeros = np.zeros((batch_size,))
             yield [
-                np.asarray(batch_images),
-                np.asarray(batch_blobs),
+                np.asarray(batch_blended),
+                np.asarray(batch_a),
+                np.asarray(batch_b),
             ], [zeros]
             batch_images = []
-            batch_blobs = []
 
 
 def iterate_supervised(dataset_path, batch_size, masks, shuffle=True, augment=True):
@@ -740,7 +889,7 @@ def iterate_supervised(dataset_path, batch_size, masks, shuffle=True, augment=Tr
             image_file = paths['image']
             map_file = paths.get('map')
             water_file = paths.get('water')
-            grass_file = paths.get('grass')
+            wetmeadow_file = paths.get('wetmeadow')
 
             # read images
             image = Image.open(image_file)
@@ -770,19 +919,19 @@ def iterate_supervised(dataset_path, batch_size, masks, shuffle=True, augment=Tr
                 assert water_detection.mode == 'L'
                 water_detection = np.asarray(water_detection)
 
-            # read grass
-            if grass_file is None:
+            # read wetmeadow
+            if wetmeadow_file is None:
                 masks.append(0)
-                grass_detection = np.zeros((width, height), np.uint8)
+                wetmeadow_detection = np.zeros((width, height), np.uint8)
             else:
                 masks.append(1)
-                grass_detection = Image.open(grass_file)
-                assert grass_detection.mode == 'L'
-                grass_detection = np.asarray(grass_detection)
+                wetmeadow_detection = Image.open(wetmeadow_file)
+                assert wetmeadow_detection.mode == 'L'
+                wetmeadow_detection = np.asarray(wetmeadow_detection)
 
             assert map_detection.shape == (width, height)
             assert map_detection.shape == water_detection.shape
-            assert map_detection.shape == grass_detection.shape
+            assert map_detection.shape == wetmeadow_detection.shape
 
             # augment
             if augment:
@@ -797,16 +946,16 @@ def iterate_supervised(dataset_path, batch_size, masks, shuffle=True, augment=Tr
                     water_detection = randaug.augment('mask', water_detection)
                     water_detection = (water_detection >= 128).astype(np.float32)
 
-                if grass_file is not None:
-                    grass_detection = randaug.augment('mask', grass_detection)
-                    grass_detection = (grass_detection >= 128).astype(np.float32)
+                if wetmeadow_file is not None:
+                    wetmeadow_detection = randaug.augment('mask', wetmeadow_detection)
+                    wetmeadow_detection = (wetmeadow_detection >= 128).astype(np.float32)
             else:
                 if map_file is not None:
                     map_detection = map_detection.astype(np.float32) / 255
                 if water_file is not None:
                     water_detection = water_detection.astype(np.float32) / 255
-                if grass_file is not None:
-                    grass_detection = grass_detection.astype(np.float32) / 255
+                if wetmeadow_file is not None:
+                    wetmeadow_detection = wetmeadow_detection.astype(np.float32) / 255
 
             # add to batch
             batch_images.append(image)
@@ -815,7 +964,7 @@ def iterate_supervised(dataset_path, batch_size, masks, shuffle=True, augment=Tr
                 np.concatenate([
                     map_detection[..., np.newaxis],
                     water_detection[..., np.newaxis],
-                    grass_detection[..., np.newaxis],
+                    wetmeadow_detection[..., np.newaxis],
                 ], axis=-1)
             )
 

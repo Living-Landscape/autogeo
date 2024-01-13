@@ -114,7 +114,7 @@ def annotate_nnet(objects_path, images_path, annotated_path, model_path, include
         output_names = [
             f'{object_id}_{image_id}_map',
             f'{object_id}_{image_id}_water',
-            f'{object_id}_{image_id}_wmeadow',
+            f'{object_id}_{image_id}_wetmeadow',
         ]
         if output_names[0] in annotated:
             print(' * already done, skipping')
@@ -363,7 +363,7 @@ def annotate_water(objects_path, images_path, annotated_path, include_path=None)
             mask.save(fp, format='png')
 
 
-def annotate_manually(images_path, preannotated_path, annotated_path, image_path, show, paint):
+def annotate_manually(images_path, preannotated_path, annotated_path, image_path, mask, show, paint):
     """
     Annotate manually
     """
@@ -373,7 +373,9 @@ def annotate_manually(images_path, preannotated_path, annotated_path, image_path
     images = set(os.listdir(images_path))
     preannotations = set(os.listdir(preannotated_path))
     annotated = set(os.listdir(annotated_path))
-    to_annotate = {name.rsplit('_', 1)[0]: name for name in preannotations - annotated}
+    to_annotate = {}
+    for name in preannotations - annotated:
+        to_annotate.setdefault(name.rsplit('_', 1)[0], []).append(name)
     common = images & set(to_annotate.keys())
     print('already annotated', len(annotated))
     print('available annotations', len(common))
@@ -389,16 +391,27 @@ def annotate_manually(images_path, preannotated_path, annotated_path, image_path
         if image_path not in common and show not in ('edges', 'nothing'):
             print(f'{image_path} is not in available preannotations')
             return
+        if mask is not None and f'{image_path}_{mask}' not in to_annotate[image_path]:
+            print(f'{image_path}_{mask} is not in available preannotations')
+            return
         picked = image_path
     image_path = os.path.join(images_path, picked)
     if show in ('edges', 'nothing'):
         mask_path = None
-        output_path = os.path.join(annotated_path, f'{picked}_generic')
-        tmp_path = os.path.join('/tmp', f'{picked}_generic.png')
+        if mask is None:
+            output_path = os.path.join(annotated_path, f'{picked}_generic')
+            tmp_path = os.path.join('/tmp', f'{picked}_generic.png')
+        else:
+            output_path = os.path.join(annotated_path, f'{picked}_{mask}')
+            tmp_path = os.path.join('/tmp', f'{picked}_{mask}.png')
     else:
-        mask_path = os.path.join(preannotated_path, to_annotate[picked])
-        output_path = os.path.join(annotated_path, to_annotate[picked])
-        tmp_path = os.path.join('/tmp', f'{to_annotate[picked]}.png')
+        if mask is None:
+            picked_name = to_annotate[picked][0]
+        else:
+            picked_name = f'{picked}_{mask}'
+        mask_path = os.path.join(preannotated_path, picked_name)
+        output_path = os.path.join(annotated_path, picked_name)
+        tmp_path = os.path.join('/tmp', f'{picked_name}.png')
     print('image', image_path)
     print('mask', mask_path)
     print('annotated', output_path)
@@ -609,6 +622,7 @@ def main():
     parser_manual.add_argument('preannotated_path', help='path with preannotated masks')
     parser_manual.add_argument('annotated_path', help='path with annotations')
     parser_manual.add_argument('--image', default=None, help='custom path to image')
+    parser_manual.add_argument('--mask', default=None, help='custom mask type')
     parser_manual.add_argument('--show', choices=['mask', 'inverted_mask', 'edges', 'nothing'], default='mask', help='how to show annotations')
     parser_manual.add_argument('--paint', default='pinta', help='application for annotations')
 
@@ -620,7 +634,7 @@ def main():
     parser_check_dir = subparsers.add_parser('check-dir', help='check annotated images in directory')
     parser_check_dir.add_argument('images_path', help='path with images')
     parser_check_dir.add_argument('annotated_path', help='path with annotations')
-    parser_check_dir.add_argument('--mask', choices=['map', 'water', 'wmeadow', 'dmeadow'], default='map', help='show chosen mask type')
+    parser_check_dir.add_argument('--mask', required=True, help='show chosen mask type')
     parser_check_dir.add_argument('--exclude', default=None, help='exclude images in given dir')
     parser_check_dir.add_argument('--random', action='store_true', help='show annotations in random order')
     parser_check_dir.add_argument('--show-pair', action='store_true', help='show image and mask')
@@ -634,7 +648,7 @@ def main():
     elif args.mode == 'nnet':
         annotate_nnet(args.objects_path, args.images_path, args.annotated_path, args.model, args.include)
     elif args.mode == 'manual':
-        annotate_manually(args.images_path, args.preannotated_path, args.annotated_path, args.image, args.show, args.paint)
+        annotate_manually(args.images_path, args.preannotated_path, args.annotated_path, args.image, args.mask, args.show, args.paint)
     elif args.mode == 'check':
         check_annotations(args.images_path, args.annotated_path, args.show_pair)
     elif args.mode == 'check-dir':
