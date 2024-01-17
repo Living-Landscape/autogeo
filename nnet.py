@@ -228,18 +228,44 @@ def msf_block(inputs, filters, scale='same'):
     return x
 
 
+def fast_model_parameters():
+    """
+    Return parameters for fast model
+    """
+    return {
+        'img_size': (512, 512),
+        'filters': [24, 32, 64, 64, 64, 64, 128, 256],
+        'depth': 6,  # model trunk layers count
+        'resolution': 3,  # scaling factor of model trunk (2 ** resolution)
+    }
+
+
+def strong_model_parameters():
+    """
+    Return parameters for strong model
+    """
+    return {
+        'img_size': (512, 512),
+        'filters': [24, 32, 64, 64, 64, 64, 128, 256],
+        'depth': 12,  # model trunk layers count
+        'resolution': 2,  # scaling factor of model trunk (2 ** resolution)
+    }
+
+
 class EncoderNN:
     """
     Encoder for NN
     """
 
-    def __init__(self, model=None):
+    def __init__(self, model=None, parameters=None):
         """
         Initialize net
         """
-        self.img_size = (512, 512)
-        self.scales = 5
-        self.filters = [24, 32, 64, 64, 64, 64, 128, 256]
+        self.img_size = parameters['img_size']
+        self.filters = parameters['filters']
+        self.depth = parameters['depth']
+        self.resolution = parameters['resolution']
+        self.scales = len(self.filters) - self.resolution
 
         if model is None:
             self.model = self.build()
@@ -269,22 +295,17 @@ class EncoderNN:
             x[n] = tf.image.resize(oklab, (size, size))
 
         # downscale
-        x = msf_block(x, filters[0:scales + 0], 'down')
-        x = msf_block(x, filters[1:scales + 1], 'down')
-        x = msf_block(x, filters[2:scales + 2], 'down')
+        for scale in range(self.resolution):
+            x = msf_block(x, filters[scale:scales + scale], 'down')
 
         # body
-        x = msf_block(x, filters[3:scales + 3], 'same')
-        x = msf_block(x, filters[3:scales + 3], 'same')
-        x = msf_block(x, filters[3:scales + 3], 'same')
-        x = msf_block(x, filters[3:scales + 3], 'same')
-        x = msf_block(x, filters[3:scales + 3], 'same')
-        x = msf_block(x, filters[3:scales + 3], 'same')
-        x = msf_block(x, filters[2:scales + 2], 'same')
+        for _ in range(self.depth):
+            x = msf_block(x, filters[self.resolution:scales + self.resolution], 'same')
+        x = msf_block(x, filters[self.resolution - 1:scales + self.resolution - 1], 'same')
 
         # upscale
-        x = msf_block(x, filters[1:scales + 1], 'up')
-        x = msf_block(x, filters[0:scales + 0], 'up')
+        for scale in range(self.resolution - 2, -1, -1):
+            x = msf_block(x, filters[scale:scales + scale], 'up')
 
         # encoder
         self.model = tf.keras.Model(
@@ -300,7 +321,7 @@ class UnsupervisedNN:
     """
     Unsupervised NN, reconstruction
     """
-    def __init__(self, path=None):
+    def __init__(self, path=None, parameters=None):
         """
         Initialize net
         """
@@ -309,7 +330,7 @@ class UnsupervisedNN:
 
         # create / load model
         if path is None:
-            self.build_training(EncoderNN())
+            self.build_training(EncoderNN(parameters=parameters))
         else:
             self.load(path)
 
@@ -396,7 +417,7 @@ class DetectorNN:
     """
     Detector NN, semantic segmentation
     """
-    def __init__(self, load=None):
+    def __init__(self, load=None, parameters=None):
         """
         Initialize net
         """
@@ -407,7 +428,7 @@ class DetectorNN:
 
         # create / load model
         if load is None:
-            self.build_training(EncoderNN())
+            self.build_training(EncoderNN(parameters=parameters))
         else:
             model_type, path = load
             if model_type == 'detector':

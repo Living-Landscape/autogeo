@@ -21,11 +21,13 @@ from model_simple import SimpleDetector
 from model_nnet import NNetDetector
 
 
-def iterate_images(objects_path, images_path, include_path=None):
+def iterate_images(objects_path, images_path, include_path=None, random_order=False):
     """
     Iterate through downloaded images
     """
     objects = [int(object_id) for object_id in os.listdir(objects_path)]
+    if random_order:
+        random.shuffle(objects)
 
     if include_path is None:
         included = None
@@ -56,13 +58,13 @@ def iterate_images(objects_path, images_path, include_path=None):
             }
 
 
-def annotate_maps(objects_path, images_path, annotated_path, include_path=None):
+def annotate_maps(objects_path, images_path, annotated_path, include_path=None, random_order=False):
     """
     Create annotations of map masks
     """
     annotated = {name for name in os.listdir(annotated_path)}
 
-    for info in iterate_images(objects_path, images_path, include_path):
+    for info in iterate_images(objects_path, images_path, include_path, random_order):
         object_id = info['object_id']
         image_id = info['image_id']
         image_path = info['image_path']
@@ -98,7 +100,7 @@ def annotate_maps(objects_path, images_path, annotated_path, include_path=None):
             image.save(fp, format='PNG')
 
 
-def annotate_nnet(objects_path, images_path, annotated_path, model_path, include_path=None):
+def annotate_nnet(objects_path, images_path, annotated_path, model_path, include_path=None, random_order=False):
     """
     Create annotations of masks with neural network
     """
@@ -106,7 +108,7 @@ def annotate_nnet(objects_path, images_path, annotated_path, model_path, include
 
     annotated = {name for name in os.listdir(annotated_path)}
 
-    for info in iterate_images(objects_path, images_path, include_path):
+    for info in iterate_images(objects_path, images_path, include_path, random_order):
         object_id = info['object_id']
         image_id = info['image_id']
         image_path = info['image_path']
@@ -277,7 +279,7 @@ def find_edges(image):
     return edges
 
 
-def annotate_water(objects_path, images_path, annotated_path, include_path=None):
+def annotate_water(objects_path, images_path, annotated_path, include_path=None, random_order=False):
     """
     Annotate water
     """
@@ -311,7 +313,7 @@ def annotate_water(objects_path, images_path, annotated_path, include_path=None)
     annotated = {name for name in os.listdir(annotated_path)}
 
     # iterate through images
-    for info in iterate_images(objects_path, images_path, include_path):
+    for info in iterate_images(objects_path, images_path, include_path, random_order):
         object_id = info['object_id']
         image_id = info['image_id']
         image_path = info['image_path']
@@ -590,6 +592,28 @@ def check_annotations_dir(images_path, annotated_path, mask_type, excluded_path,
             fp.write(f'{mask_name}\n')
 
 
+def show_not_annotated(images_path, annotated_path, mask_type, random_order):
+    """
+    Show images that are not annotated
+    """
+    annotated_images = set()
+    annotated_dict = {}
+    for name in os.listdir(annotated_path):
+        split = name.split('_')
+        base_name = '_'.join(split[:2])
+        mask = split[-1]
+        annotated_images.add(base_name)
+        annotated_dict.setdefault(mask, []).append(base_name)
+    not_annotated = set(annotated_images) - set(annotated_dict.get(mask_type, []))
+
+    print('annotated images', len(annotated_images))
+    print(f'not annotated images for {mask_type}', len(not_annotated))
+    for name in not_annotated:
+        print(name)
+        image_path = os.path.join(images_path, name)
+        subprocess.run(['eog', image_path])
+
+
 def main():
     """
     Anntations helper
@@ -603,12 +627,14 @@ def main():
     parser_maps.add_argument('images_path', help='path with images to annotate')
     parser_maps.add_argument('annotated_path', help='path with annotations')
     parser_maps.add_argument('--include', default=None, help='use only included images')
+    parser_maps.add_argument('--random', action='store_true', help='annotate in random order')
 
     parser_water = subparsers.add_parser('water', help='annotate water')
     parser_water.add_argument('objects_path', help='path with objects to annotate')
     parser_water.add_argument('images_path', help='path with images to annotate')
     parser_water.add_argument('annotated_path', help='path with annotations')
     parser_water.add_argument('--include', default=None, help='use only inlcuded images')
+    parser_water.add_argument('--random', action='store_true', help='annotate in random order')
 
     parser_nnet = subparsers.add_parser('nnet', help='annotate with nerual network')
     parser_nnet.add_argument('objects_path', help='path with objects to annotate')
@@ -616,6 +642,7 @@ def main():
     parser_nnet.add_argument('annotated_path', help='path with annotations')
     parser_nnet.add_argument('--include', default=None, help='use only included images')
     parser_nnet.add_argument('--model', default='nnet.tflite', help='path to nnet model')
+    parser_nnet.add_argument('--random', action='store_true', help='annotate in random order')
 
     parser_manual = subparsers.add_parser('manual', help='manual annotation')
     parser_manual.add_argument('images_path', help='path with images to annotate')
@@ -639,20 +666,28 @@ def main():
     parser_check_dir.add_argument('--random', action='store_true', help='show annotations in random order')
     parser_check_dir.add_argument('--show-pair', action='store_true', help='show image and mask')
 
+    parser_show_not_annotated = subparsers.add_parser('show-not-annotated', help='show images that are not annotated')
+    parser_show_not_annotated.add_argument('images_path', help='path with images')
+    parser_show_not_annotated.add_argument('annotated_path', help='path with annotations')
+    parser_show_not_annotated.add_argument('--mask', required=True, help='show images for specified mask')
+    parser_show_not_annotated.add_argument('--random', action='store_true', help='show annotations in random order')
+
     args = argparser.parse_args()
 
     if args.mode == 'maps':
-        annotate_maps(args.objects_path, args.images_path, args.annotated_path, args.include)
+        annotate_maps(args.objects_path, args.images_path, args.annotated_path, args.include, args.random)
     elif args.mode == 'water':
-        annotate_water(args.objects_path, args.images_path, args.annotated_path, args.include)
+        annotate_water(args.objects_path, args.images_path, args.annotated_path, args.include, args.random)
     elif args.mode == 'nnet':
-        annotate_nnet(args.objects_path, args.images_path, args.annotated_path, args.model, args.include)
+        annotate_nnet(args.objects_path, args.images_path, args.annotated_path, args.model, args.include, args.random)
     elif args.mode == 'manual':
         annotate_manually(args.images_path, args.preannotated_path, args.annotated_path, args.image, args.mask, args.show, args.paint)
     elif args.mode == 'check':
         check_annotations(args.images_path, args.annotated_path, args.show_pair)
     elif args.mode == 'check-dir':
         check_annotations_dir(args.images_path, args.annotated_path, args.mask, args.exclude, args.random, args.show_pair)
+    elif args.mode == 'show-not-annotated':
+        show_not_annotated(args.images_path, args.annotated_path, args.mask, args.random)
     else:
         assert False
 
