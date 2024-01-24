@@ -15,7 +15,6 @@ from PIL import Image
 import numpy as np
 import cv2
 
-from model_simple import SimpleDetector
 from model_nnet import NNetDetector
 
 
@@ -72,7 +71,7 @@ def process(job_id, detector_type, output_format):
     """
     Extract map parts
     """
-    assert detector_type in ('simple', 'nnet'), f'Unsupported detector type {detector_type}'
+    assert detector_type in ('nnet', ), f'Unsupported detector type {detector_type}'
     assert output_format in ('png', 'webp', 'jpg'), f'Unsupported output format {output_format}'
 
     try:
@@ -136,10 +135,7 @@ def process(job_id, detector_type, output_format):
         wetmeadow_index = 2
         names = ['mapa', 'voda', 'mokre_louky']
 
-        if detector_type == 'simple':
-            detector = SimpleDetector(image)
-            segments, masks = detector.detect()
-        elif detector_type == 'nnet':
+        if detector_type == 'nnet':
             detector = NNetDetector('model_nnet.tflite', image)
             last_progress_update = None
             segments, masks, confidence = detector.detect(progress_fn)
