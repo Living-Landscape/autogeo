@@ -10,7 +10,7 @@ import numba
 from model import Detector
 
 
-@numba.jit
+@numba.jit(nopython=False)
 def should_expand(x, y, image, width, height, mask, edges, min_tolerance, max_tolerance, seen):
     """
     Return if we should expand neighbors in floodfill

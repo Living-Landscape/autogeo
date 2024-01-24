@@ -1,6 +1,6 @@
 # Automatic georeferencing of historical maps
 
-Project aims to automatically georeference "Císařské otisky" from https://ags.cuzk.cz/archiv/. The process is multistage and in progress. The result will be the web service where an users can georeference their own maps.
+Project aims to segment and georeference "Císařské otisky" from https://ags.cuzk.cz/archiv/. The process is multistage and in progress. The result will be the web service where an users can georeference their own maps.
 
 ![segmentation](https://github.com/Living-Landscape/autogeo/blob/d51055e019b3b07fc72cb8224718e6a1b502fc99/docs/segmentation.png)
 

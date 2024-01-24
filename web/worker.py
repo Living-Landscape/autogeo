@@ -133,6 +133,8 @@ def process(job_id, detector_type, output_format):
         # extract map blobs
         map_index = 0
         water_index = 1
+        wetmeadow_index = 2
+        names = ['mapa', 'voda', 'mokre_louky']
 
         if detector_type == 'simple':
             detector = SimpleDetector(image)
@@ -141,48 +143,53 @@ def process(job_id, detector_type, output_format):
             detector = NNetDetector('model_nnet.tflite', image)
             last_progress_update = None
             segments, masks, confidence = detector.detect(progress_fn)
+            masks = 255 * masks
         if not segments[map_index]:  # map mask
             raise NoMapsFound('Nepodařilo se najít žádné mapy na obrázku.')
 
         # zip with images
         with zipfile.ZipFile(result_path, 'w', zipfile.ZIP_DEFLATED) as zip_file:
             for n, map_segment in enumerate(segments[map_index]):
+                map_box, map_contour = map_segment
+                map_left, map_top, map_right, map_bottom = map_box
+                map_width = map_right - map_left + 1
+                map_height = map_bottom - map_top + 1
+
                 # create image for detected map segment
                 map_image = detector.draw_segment(map_segment)
                 if resize_ratio is not None:
-                    map_image = cv2.resize(map_image, (image_width, image_height), interpolation=cv2.INTER_CUBIC)
+                    map_image = cv2.resize(map_image, (resize_ratio * map_width, resize_ratio * map_height), interpolation=cv2.INTER_CUBIC)
 
                 # write map image
-                save_image(map_image, f'mapa_{n + 1}', output_format, zip_file)
+                save_image(map_image, f'{names[map_index]}_{n + 1}', output_format, zip_file)
 
                 del map_image
                 gc.collect()
 
                 # find all water chunks inside current map segment
-                map_box, map_contour = map_segment
-                map_left, map_top, map_right, map_bottom = map_box
-                water_image = None
-                for water_segment in segments[water_index]:
-                    _, contour = water_segment
-                    left = np.min(contour[..., 0])
-                    right = np.max(contour[..., 0])
-                    top = np.min(contour[..., 1])
-                    bottom = np.max(contour[..., 1])
+                for mask_index in [water_index, wetmeadow_index]:
+                    # draw mask image
+                    mask_image = None
+                    for p, mask_segment in enumerate(segments[mask_index]):
+                        (left, top, right, bottom), contour = mask_segment
+                        if (
+                            (map_left <= left < map_right or map_left <= right < map_right) and
+                            (map_top <= top < map_bottom or map_top <= bottom < map_bottom)
+                        ):
+                            mask_image = detector.draw_segment((map_box, contour), erase=mask_image is None)
 
-                    if (
-                        (map_left <= left < map_right or map_left <= right < map_right) and
-                        (map_top <= top < map_bottom or map_top <= bottom < map_bottom)
-                    ):
-                        water_image = detector.draw_segment((map_box, contour), erase=water_image is None)
+                    # write mask image
+                    if mask_image is not None:
+                        mask_image[..., 3] = np.minimum(  # intersection of original mask and computed polygon
+                            masks[map_top:map_bottom + 1, map_left:map_right + 1, mask_index],
+                            mask_image[..., 3],
+                        )
+                        if resize_ratio:
+                            mask_image = cv2.resize(mask_image, (resize_ratio * map_width, resize_ratio * map_height), interpolation=cv2.INTER_CUBIC)
+                        save_image(mask_image, f'{names[mask_index]}_{n + 1}', output_format, zip_file)
 
-                # write water image
-                if water_image is not None:
-                    if resize_ratio:
-                        water_image = cv2.resize(water_image, (image_width, image_height), interpolation=cv2.INTER_CUBIC)
-                    save_image(water_image, f'voda_{n + 1}', output_format, zip_file)
-
-                del water_image
-                gc.collect()
+                    del mask_image
+                    gc.collect()
 
             # background colors
             if output_format == 'jpg':

@@ -9,23 +9,10 @@ from scipy import ndimage
 from model import Detector
 
 
-def prediction_confidence(predictions, thresholds):
-    """
-    Compute prediction confidence
-    """
-    shape = predictions.shape
-    topn = int(0.05 * shape[1] * shape[2])
-
-    predictions = np.reshape(predictions, (shape[0], shape[1] * shape[2], shape[3]))
-    errors = 1 - 2 * np.abs(thresholds - np.maximum(0, np.minimum(1, predictions)))
-
-    return 1 - np.mean(np.sort(errors, axis=1)[:, -topn:, :], axis=1)
-
-
 class TFLiteModel:
 
     def __init__(self, path):
-        self.thresholds = (0.56, 0.41, 0.5)
+        self.thresholds = (0.60, 0.64, 0.58)
 
         self.interpreter = tflite.Interpreter(model_path=path)
         self.interpreter.allocate_tensors()
@@ -51,10 +38,9 @@ class TFLiteModel:
         image = image.astype(np.float32)[np.newaxis, ...]
         self.interpreter.set_tensor(self.in_img['index'], image)
         self.interpreter.invoke()
-        out = self.interpreter.get_tensor(self.p_out['index'])
-        confidence = prediction_confidence(out, self.thresholds)
+        predictions = self.interpreter.get_tensor(self.p_out['index'])
 
-        return out[0], confidence[0]
+        return predictions[0]
 
 
 def remove_thin_structures(mask):
@@ -79,7 +65,7 @@ class NNetDetector(Detector):
         self.model = TFLiteModel(model_path)
 
 
-    def detect(self, progress_callback=None):
+    def detect(self, progress_callback=None, return_confidence_masks=False):
         """
         Detect map segments
         Returns segments, masks
@@ -93,12 +79,14 @@ class NNetDetector(Detector):
         if self.image_width < chunk_size or self.image_height < chunk_size:
             masks = np.zeros((*image.shape[:2], 3), np.uint8)
             segments = [[], [], []]
-            return segments, masks, [1.0, 1.0, 1.0]
+            if return_confidence_masks:
+                return segments, masks, np.ones((3,)), np.zeros((*image.shape[:2], 3), np.uint8)
+            else:
+                return segments, masks, np.ones((3,))
 
         # run nnet inference on chunks, averaging results
         masks = np.zeros((*image.shape[:2], 3), np.float32)
         counts = np.zeros((*image.shape[:2], 1), np.uint8)
-        confidences = []
         iterations = 0
         for x in range(0, image.shape[1], chunk_size - overlap):
             for y in range(0, image.shape[0], chunk_size - overlap):
@@ -114,23 +102,34 @@ class NNetDetector(Detector):
                 top = min(top, bottom - chunk_size)
 
                 chunk = image[top:bottom, left:right, :3]
-                outputs, chunk_confidence = self.model.predict(chunk)
+                chunk_outputs = self.model.predict(chunk)
 
-                masks[top:bottom, left:right] += outputs
+                masks[top:bottom, left:right] += chunk_outputs
                 counts[top:bottom, left:right] += 1
-                confidences.append(chunk_confidence)
                 iterations += 1
         masks = masks / counts
+
+        # compute confidences
+        confidence_margin = 0.3
+        confidences = 0.5 - masks
+        confidences = np.abs(confidences)
+        confidences = confidences <= 0.5 * confidence_margin
+        confidence_values = 1 - (np.sum(confidences, axis=(0, 1)) / (image.shape[0] * image.shape[1])) ** 0.5
+        confidence_values = np.maximum(0, confidence_values - 0.5) * 2
+        if return_confidence_masks:
+            confidences = confidences.astype(np.uint8)
+        else:
+            confidences = None
+
+        # convert masks
         masks = masks > self.model.thresholds
         masks = masks.astype(np.uint8)
-        topn = max(1, int(iterations / 20))
-        confidence = np.mean(np.sort(confidences, axis=0)[:topn], axis=0)
 
         min_map_ratio = 20
         min_water_ratio = 200
-        min_grass_ratio = 1
+        min_wetmeadow_ratio = 200
 
-        # post-processing maps
+        # maps post-processing
         masks[..., 0] = ndimage.binary_fill_holes(masks[..., 0])
         masks[..., 0] = masks[..., 0].astype(np.uint8)
         masks[..., 0] = remove_thin_structures(masks[..., 0])
@@ -138,7 +137,10 @@ class NNetDetector(Detector):
         # find map segments
         segments = [
             list(self.find_segments(masks[..., n], min_area_ratio))
-            for n, min_area_ratio in enumerate([min_map_ratio, min_water_ratio, min_grass_ratio])
+            for n, min_area_ratio in enumerate([min_map_ratio, min_water_ratio, min_wetmeadow_ratio])
         ]
 
-        return segments, masks, confidence
+        if return_confidence_masks:
+            return segments, masks, confidence_values, confidences
+        else:
+            return segments, masks, confidence_values

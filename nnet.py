@@ -102,11 +102,18 @@ class SegmentationLoss(tf.keras.layers.Layer):
     Loss layer, l2 segmentation loss
     """
 
+    def __init__(self, logvars=None):
+        self.logvars_init = logvars
+
+
     def build(self, input_shapes):
         """
         Create variables
         """
-        self.logvars = self.add_weight(shape=(1, input_shapes[-1]), initializer=tf.constant_initializer(value=-3), name='logvars', trainable=True)
+        if self.logvars_init is None:
+            self.logvars = self.add_weight(shape=(1, input_shapes[-1]), initializer=tf.constant_initializer(value=-3), name='logvars', trainable=True)
+        else:
+            self.logvars = self.add_weight(shape=(1, input_shapes[-1]), initializer=tf.constant_initializer(value=self.logvars_init), name='logvars', trainable=True)
 
 
     def call(self, in_masks, in_detections, p_detections):
@@ -247,7 +254,7 @@ def strong_model_parameters():
     return {
         'img_size': (512, 512),
         'filters': [24, 32, 64, 64, 64, 64, 128, 256],
-        'depth': 12,  # model trunk layers count
+        'depth': 8,  # model trunk layers count
         'resolution': 2,  # scaling factor of model trunk (2 ** resolution)
     }
 
@@ -961,15 +968,15 @@ def iterate_supervised(dataset_path, batch_size, masks, shuffle=True, augment=Tr
 
                 if map_file is not None:
                     map_detection = randaug.augment('mask', map_detection)
-                    map_detection = (map_detection >= 128).astype(np.float32)
+                    map_detection = (map_detection / 255).astype(np.float32)
 
                 if water_file is not None:
                     water_detection = randaug.augment('mask', water_detection)
-                    water_detection = (water_detection >= 128).astype(np.float32)
+                    water_detection = (water_detection / 255).astype(np.float32)
 
                 if wetmeadow_file is not None:
                     wetmeadow_detection = randaug.augment('mask', wetmeadow_detection)
-                    wetmeadow_detection = (wetmeadow_detection >= 128).astype(np.float32)
+                    wetmeadow_detection = (wetmeadow_detection / 255).astype(np.float32)
             else:
                 if map_file is not None:
                     map_detection = map_detection.astype(np.float32) / 255

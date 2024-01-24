@@ -7,18 +7,24 @@ import json
 import random
 import subprocess
 import threading
+import heapq
+import math
+import shutil
+import tarfile
+from multiprocessing import Process
 
 import numpy as np
 import cv2
 from PIL import Image, ImageOps
 import matplotlib.pyplot as plt
+import filelock
 
 if 'web' not in sys.path:
     sys.path.append('web')
 
 import utils
 from model_simple import SimpleDetector
-from model_nnet import NNetDetector
+from model_nnet import TFLiteModel, NNetDetector
 
 
 def iterate_images(objects_path, images_path, include_path=None, random_order=False):
@@ -56,6 +62,8 @@ def iterate_images(objects_path, images_path, include_path=None, random_order=Fa
                 'object_id': object_id,
                 'image_id': image_id,
             }
+            if random_order:
+                break
 
 
 def annotate_maps(objects_path, images_path, annotated_path, include_path=None, random_order=False):
@@ -105,6 +113,7 @@ def annotate_nnet(objects_path, images_path, annotated_path, model_path, include
     Create annotations of masks with neural network
     """
     model_path = os.path.join(os.getcwd(), model_path)
+    meta_path = os.path.join(annotated_path, 'meta.json')
 
     annotated = {name for name in os.listdir(annotated_path)}
 
@@ -136,18 +145,37 @@ def annotate_nnet(objects_path, images_path, annotated_path, model_path, include
         try:
             image = np.array(image.resize((image_width // 4, image_height // 4)))
             detector = NNetDetector(model_path, image)
-            segments, masks, confidence = detector.detect()
+            segments, masks, confidences, confidence_masks = detector.detect(return_confidence_masks=True)
         finally:
             os.chdir('..')
         print(f' * detected {len(segments[0])} segments')
 
-        # save mask
+        # save masks
         print(' * writing results')
         for n in range(len(output_names)):
             with open(os.path.join(annotated_path, output_names[n]), 'wb') as fp:
                 image = Image.fromarray(masks[..., n] * 255)
                 image = image.resize((image_width, image_height))
                 image.save(fp, format='PNG')
+
+            with open(os.path.join(annotated_path, output_names[n] + '-confidence'), 'wb') as fp:
+                image = Image.fromarray(confidence_masks[..., n] * 255)
+                image = image.resize((image_width, image_height))
+                image.save(fp, format='PNG')
+
+        # save confidences
+        try:
+            with filelock.FileLock(f'{meta_path}.lock'):
+                with open(meta_path) as fp:
+                    meta = json.load(fp)
+        except FileNotFoundError:
+            meta = {}
+        meta.setdefault('confidence', []).append((
+            f'{object_id}_{image_id}',
+            *confidences.astype(float)
+        ))
+        with open(meta_path, 'w') as fp:
+            json.dump(meta, fp, indent=4)
 
 
 def rgb_to_oklab(colors):
@@ -533,18 +561,23 @@ def check_annotations(images_path, annotated_path, show_pair):
         masked_original = (0.5 * mask * image).astype(np.uint8)
         masked_color = (0.5 * mask * [[color]]).astype(np.uint8)
         non_masked = ((1 - mask) * image).astype(np.uint8)
-        image = masked_color + masked_original + non_masked
+        image_tp = masked_color + masked_original + non_masked
 
         if show_pair:
-            mask = [[(255, 255, 255)]] * mask
-            mask = mask.astype(np.uint8)
-            image = np.hstack([image, mask])
+            masked_original = (0.5 * (1 - mask) * image).astype(np.uint8)
+            masked_color = (0.5 * (1 - mask) * [[color]]).astype(np.uint8)
+            non_masked = (mask * image).astype(np.uint8)
+            image_tn = masked_color + masked_original + non_masked
+            image = np.hstack([image_tp, image_tn])
+            image = image_tn
+        else:
+            image = image_tp
 
         image = Image.fromarray(image)
         image.save(tmp_path, format='png')
 
         print('check annotations')
-        subprocess.run(['eog', tmp_path])
+        subprocess.run(['eog', '--fullscreen', tmp_path])
     finally:
         try:
             os.remove(tmp_path)
@@ -573,7 +606,6 @@ def check_annotations_dir(images_path, annotated_path, mask_type, excluded_path,
         pass  # nothing was checked already
     print(f'excluding {len(excluded_names)} from altogether')
 
-
     # iterate through the directory
     names = os.listdir(annotated_path)
     if random_order:
@@ -592,7 +624,7 @@ def check_annotations_dir(images_path, annotated_path, mask_type, excluded_path,
             fp.write(f'{mask_name}\n')
 
 
-def show_not_annotated(images_path, annotated_path, mask_type, random_order):
+def show_unannotated(images_path, annotated_path, mask_type, random_order):
     """
     Show images that are not annotated
     """
@@ -612,6 +644,147 @@ def show_not_annotated(images_path, annotated_path, mask_type, random_order):
         print(name)
         image_path = os.path.join(images_path, name)
         subprocess.run(['eog', image_path])
+
+def select_confidence_column(images, groups, selected, beam_size, column):
+    """
+    Select image from given column
+    """
+    preselected = heapq.nlargest(beam_size, images.items(), key=lambda item: -np.mean(item[1]))
+    chosen = preselected[min(  # argmin
+        range(len(preselected)),
+        key=lambda item: preselected.__getitem__(item)[1][column],
+    )]
+    selected.append(chosen)
+    images.pop(chosen[0])
+    group = chosen[0].split('_', 1)[0]
+    for image in groups[group]:
+        try:
+            images.pop(image)
+        except KeyError:
+            pass  # already excluded
+
+
+def sort_confidence(annotated_path, count):
+    """
+    Sort automatic annotations according to prediction confidence
+    """
+    meta_path = os.path.join(annotated_path, 'meta.json')
+
+    # load confidence scores
+    with filelock.FileLock(f'{meta_path}.lock'):
+        with open(meta_path) as fd:
+            meta = json.load(fd)
+    confidences = meta['confidence']
+
+    # statistics
+    mean_confidences = np.mean([confidence[1:] for confidence in confidences], axis=0)
+    print('mean confidences', mean_confidences)
+
+    images = {confidence[0]: confidence[1:] for confidence in confidences}
+    groups = {}
+    for confidence in confidences:
+        image = confidence[0]
+        group = image.split('_')[0]
+        groups.setdefault(group, []).append(image)
+
+    # beam search
+    beam_size = max(1, len(images) // 10)
+    selected = []
+    for n in range(math.ceil(count / 3)):
+        select_confidence_column(images, groups, selected, beam_size, 0)  # map
+        select_confidence_column(images, groups, selected, beam_size, 1)  # water
+        select_confidence_column(images, groups, selected, beam_size, 2)  # wet meadow
+
+    # print results
+    for image, confidence in selected:
+        print(image, confidence)
+    print('selected mean confidence', np.mean([confidence[1] for confidence in selected], axis=0))
+
+
+def annotate_dataset_path(dataset_path, results_path, model_path):
+    """
+    Annotate compile dataset on specified path
+    """
+    # create output folder
+    try:
+        shutil.rmtree(results_path)
+    except FileNotFoundError:
+        pass
+    os.makedirs(results_path, exist_ok=True)
+
+    with open(os.path.join(dataset_path, 'info.json')) as fp:
+        info = json.load(fp)
+
+    # load model
+    model = TFLiteModel(model_path)
+
+    # iterat samples
+    new_info = []
+    for n, sample in enumerate(info['samples']):
+        print(f'\r{results_path} {n + 1}', end='')
+        image_path = sample['image'][0]
+        warp_path = sample['warp'][0]
+        image_base_path = image_path.rsplit('_', 1)[0]
+
+        # load images
+        image = np.asarray(Image.open(os.path.join(dataset_path, image_path)))
+        warp = np.asarray(Image.open(os.path.join(dataset_path, warp_path)))
+
+        # predict
+        predictions = model.predict(image)
+        predictions = np.clip(predictions, 0, 1, predictions) * 255
+        predictions = predictions.astype(np.uint8)
+
+        map_prediction = np.minimum(predictions[..., 0], warp)
+        water_prediction = np.minimum(predictions[..., 1], warp)
+        wetmeadow_prediction = np.minimum(predictions[..., 2], warp)
+
+        # info
+        sample_info = {
+            'image': (image_path, 0),
+            'map': (f'{image_base_path}_map', 0),
+            'water': (f'{image_base_path}_water', 0),
+            'wetmeadow': (f'{image_base_path}_wetmeadow', 0),
+        }
+        new_info.append(sample_info)
+
+        # save images
+        shutil.copyfile(os.path.join(dataset_path, image_path), os.path.join(results_path, image_path))
+        Image.fromarray(map_prediction).save(os.path.join(results_path, sample_info['map'][0]), format='png')
+        Image.fromarray(water_prediction).save(os.path.join(results_path, sample_info['water'][0]), format='png')
+        Image.fromarray(wetmeadow_prediction).save(os.path.join(results_path, sample_info['wetmeadow'][0]), format='png')
+    print()
+
+    # write new info
+    with open(os.path.join(results_path, 'info.json'), 'w') as fp:
+        json.dump({'samples': new_info}, fp)
+
+
+def annotate_dataset(dataset_path, results_path, model_path):
+    """
+    Annotate compiled dataset
+    """
+    train_process = Process(
+        target=annotate_dataset_path,
+        args=(os.path.join(dataset_path, 'train'), os.path.join(results_path, 'train'), model_path),
+    )
+    train_process.start()
+    val_process = Process(
+        target=annotate_dataset_path,
+        args=(os.path.join(dataset_path, 'val'), os.path.join(results_path, 'val'), model_path),
+    )
+    val_process.start()
+
+    train_process.join()
+    val_process.join()
+
+    #annotate_dataset_path(os.path.join(dataset_path, 'train'), os.path.join(results_path, 'train'), model_path)
+    #annotate_dataset_path(os.path.join(dataset_path, 'val'), os.path.join(results_path, 'val'), model_path)
+
+    # tar dataset
+    results_name = results_path.strip(os.sep).split(os.sep)[-1]
+    with tarfile.open(f'cache-{results_name}.tar', 'w') as tf:
+        tf.add(results_path)
 
 
 def main():
@@ -666,11 +839,20 @@ def main():
     parser_check_dir.add_argument('--random', action='store_true', help='show annotations in random order')
     parser_check_dir.add_argument('--show-pair', action='store_true', help='show image and mask')
 
-    parser_show_not_annotated = subparsers.add_parser('show-not-annotated', help='show images that are not annotated')
-    parser_show_not_annotated.add_argument('images_path', help='path with images')
-    parser_show_not_annotated.add_argument('annotated_path', help='path with annotations')
-    parser_show_not_annotated.add_argument('--mask', required=True, help='show images for specified mask')
-    parser_show_not_annotated.add_argument('--random', action='store_true', help='show annotations in random order')
+    parser_unannotated = subparsers.add_parser('unannotated', help='show images that are not annotated')
+    parser_unannotated.add_argument('images_path', help='path with images')
+    parser_unannotated.add_argument('annotated_path', help='path with annotations')
+    parser_unannotated.add_argument('--mask', required=True, help='show images for specified mask')
+    parser_unannotated.add_argument('--random', action='store_true', help='show annotations in random order')
+
+    parser_confidence = subparsers.add_parser('confidence', help='sort automatic annotations accoding to prediction confidence')
+    parser_confidence.add_argument('annotated_path', help='path with annotations')
+    parser_confidence.add_argument('--count', type=int, default=10, help='number of images to select')
+
+    parser_dataset = subparsers.add_parser('dataset', help='annotate compiled dataset with model annotations')
+    parser_dataset.add_argument('dataset_path', help='path with already annotated dataset')
+    parser_dataset.add_argument('results_path', help='path where new dataset should be created')
+    parser_dataset.add_argument('--model', required=True, help='model to be used for annotating dataset')
 
     args = argparser.parse_args()
 
@@ -686,8 +868,12 @@ def main():
         check_annotations(args.images_path, args.annotated_path, args.show_pair)
     elif args.mode == 'check-dir':
         check_annotations_dir(args.images_path, args.annotated_path, args.mask, args.exclude, args.random, args.show_pair)
-    elif args.mode == 'show-not-annotated':
-        show_not_annotated(args.images_path, args.annotated_path, args.mask, args.random)
+    elif args.mode == 'unannotated':
+        show_unannotated(args.images_path, args.annotated_path, args.mask, args.random)
+    elif args.mode == 'confidence':
+        sort_confidence(args.annotated_path, args.count)
+    elif args.mode == 'dataset':
+        annotate_dataset(args.dataset_path, args.results_path, args.model)
     else:
         assert False
 
