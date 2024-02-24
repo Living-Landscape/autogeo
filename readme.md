@@ -5,9 +5,9 @@ Project aims to segment and georeference "Císařské otisky" from https://ags.c
 ![segmentation](https://github.com/Living-Landscape/autogeo/blob/d51055e019b3b07fc72cb8224718e6a1b502fc99/docs/segmentation.png)
 
  * [x] web service with task queues
- * [x] segmentation of maps, water and meadows
+ * [x] segmentation of maps, water, dry and wet meadows
  * [x] output in png, jpg or webp
- * [ ] actual georeferencing
+ * [ ] georeferencing
 
 ## Installation
 
