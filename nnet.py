@@ -10,62 +10,100 @@ from tensorflow.keras import layers
 from PIL import Image, ImageEnhance, ImageOps
 
 
+def lr_schedule(max_lr, min_lr, batch, epoch_batch_count, training_batch_count):
+    """
+    Log-quadratic learning rate scheduler with warmup
+    """
+    if batch < epoch_batch_count:
+        step = batch / epoch_batch_count
+        decay = step * (max_lr - min_lr) + min_lr
+    else:
+        step = (batch - epoch_batch_count) / (training_batch_count - epoch_batch_count)
+        b = np.log(min_lr)
+        a = np.log(max_lr) - b
+        decay = np.exp(a * (1 - step ** 2) + b)
+
+    return decay
+
+
+def prewitt_kernel():
+    """
+    Return Prewitt kernel
+    """
+    prewitt = np.array([
+        [-1, 0, 1],
+        [-1, 0, 1],
+        [-1, 0, 1],
+    ], dtype=np.float32)
+    prewitt = prewitt[..., None, None]
+
+    return prewitt
+
+
+def gauss_kernel(size, sigma):
+    """
+    Return gaussian kernel
+    """
+    x = np.linspace(-0.5 * (size - 1), 0.5 * (size - 1), size)
+    kernel = np.exp((-0.5 * x ** 2) / sigma ** 2)
+    kernel = kernel.astype(np.float32)
+    kernel = kernel[:, None, None, None]
+
+    return kernel / np.sum(kernel)
+
+
 def mask_edges(masks):
     """
     Return mask of widen edges
     """
-    kernel_size = 17
     shape = tf.shape(masks)
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
-    filters = tf.convert_to_tensor(kernel, masks.dtype)
-    filters = tf.expand_dims(filters, axis=-1) * tf.ones((kernel_size, kernel_size, shape[-1]), tf.float32)
 
-    # invert borders to create an edge
-    masks = tf.concat([1 - masks[:, :1, ...], masks[:, 1:-1, ...], 1 - masks[:, -1:, ...]], axis=1)
-    masks = tf.concat([1 - masks[..., :1, :], masks[..., 1:-1, :], 1 - masks[..., -1:, :]], axis=2)
+    # build prewitt kernel
+    prewitt = prewitt_kernel()
+    prewitt = tf.convert_to_tensor(prewitt, masks.dtype)
+    prewitt = prewitt * tf.ones((3, 3, shape[-1], 1), tf.float32)
 
-    eroded = tf.nn.erosion2d(
-        masks,
-        filters=filters,
-        strides=(1, 1, 1, 1),
-        padding='SAME',
-        data_format='NHWC',
-        dilations=(1, 1, 1, 1),
-    ) + 1
-    dilated = tf.nn.dilation2d(
-        masks,
-        filters=filters,
-        strides=(1, 1, 1, 1),
-        padding='SAME',
-        data_format='NHWC',
-        dilations=(1, 1, 1, 1),
-    ) - 1
+    # find edges
+    gx = tf.nn.depthwise_conv2d(masks, prewitt, (1, 1, 1, 1), 'SAME')
+    gy = tf.nn.depthwise_conv2d(masks, tf.transpose(prewitt, (1, 0, 2, 3)), (1, 1, 1, 1), 'SAME')
+    gradient = (gx ** 2 + gy ** 2) ** 0.5
+    gradient_max = tf.reduce_max(gradient, axis=(1, 2), keepdims=True)
+    gradient = tf.where(gradient_max > 0, gradient / gradient_max, 0)
 
-    return dilated - eroded
+    # draw edges around the border
+    ones = 1 + 0 * gradient[:, :1, ...]
+    gradient = tf.concat([ones, gradient[:, 1:-1, ...], ones], axis=1)
+    ones = 1 + 0 * gradient[..., :1, :]
+    gradient = tf.concat([ones, gradient[..., 1:-1, :], ones], axis=2)
+
+    # blurring kernel
+    kernel_size = 17
+    sigma = 5
+    kernel = gauss_kernel(kernel_size, sigma)
+    kernel = tf.convert_to_tensor(kernel, masks.dtype)
+    kernel = kernel * tf.ones((kernel_size, 1, shape[-1], 1), tf.float32)
+
+    # blur
+    gradient = tf.nn.depthwise_conv2d(gradient, kernel, (1, 1, 1, 1), 'SAME')
+    gradient = tf.nn.depthwise_conv2d(gradient, tf.transpose(kernel, (1, 0, 2, 3)), (1, 1, 1, 1), 'SAME')
+
+    return tf.cast(gradient > 0.03, tf.float32)
 
 
-def boosted_edges_loss(detections, predictions):
+def boosted_edges_loss(targets, predictions):
     """
     Computes loss with boosted mask edges
     """
     # edges
-    edge_weight = tf.random.uniform((1, 1, 1, 3), 1, 40)
-    edges = mask_edges(detections)
+    edge_weight = tf.random.uniform((1, 1, 1, predictions.shape[-1]), 1, 5)
+    edges = mask_edges(targets)
 
     # weights
     weights = 1 + (edge_weight - 1) * edges
     weights = weights / tf.reduce_sum(weights, axis=(1, 2), keepdims=True)
 
-    """
-    import matplotlib.pyplot as plt
-    plt.figure()
-    plt.imshow(weights[0, ..., 0])
-    plt.colorbar()
-    plt.show()
-    """
-
-    # loss
-    loss = tf.where(detections == 1, tf.maximum(0.0,  1 - predictions) ** 2, tf.maximum(0.0, predictions) ** 2)
+    # l2 loss
+    loss = tf.where(targets == 1, tf.maximum(0.0,  1 - predictions) ** 2, tf.maximum(0.0, predictions) ** 2)
     loss = tf.reduce_sum(weights * loss, axis=(1, 2))
 
     return loss
@@ -102,25 +140,26 @@ class SegmentationLoss(tf.keras.layers.Layer):
     Loss layer, l2 segmentation loss
     """
 
-    def __init__(self, logvars=None):
-        self.logvars_init = logvars
+    def __init__(self, logvars_init=None):
+        super().__init__()
+        self.logvars_init = logvars_init
 
 
     def build(self, input_shapes):
         """
         Create variables
         """
-        if self.logvars_init is None:
-            self.logvars = self.add_weight(shape=(1, input_shapes[-1]), initializer=tf.constant_initializer(value=-3), name='logvars', trainable=True)
-        else:
-            self.logvars = self.add_weight(shape=(1, input_shapes[-1]), initializer=tf.constant_initializer(value=self.logvars_init), name='logvars', trainable=True)
+        self.logvars = self.add_weight(shape=(1, input_shapes[-1]), initializer=tf.constant_initializer(value=self.logvars_init), name='logvars', trainable=True)
 
 
-    def call(self, in_masks, in_detections, p_detections):
+    def call(self, in_masks, in_targets, p_targets):
         """
         Compute losses
         """
-        raw_losses = boosted_edges_loss(in_detections, p_detections)
+        mask_types = self.logvars.shape[-1]
+
+        # losses
+        raw_losses = boosted_edges_loss(in_targets, p_targets)
         losses = tf.math.exp(-self.logvars) * raw_losses + self.logvars
         losses = tf.reduce_mean(in_masks * losses, axis=1)
 
@@ -128,12 +167,13 @@ class SegmentationLoss(tf.keras.layers.Layer):
         self.add_loss(losses)
 
         # metrics
-        noise = (tf.math.exp(self.logvars) ** 0.5)[0]
-        self.add_metric(noise[0], name='mv')
-        self.add_metric(noise[1], name='wv')
-        self.add_metric(noise[2], name='gv')
+        noise = (tf.math.exp(self.logvars) ** 0.5)
+        for n in range(mask_types):
+            self.add_metric(noise[0, n], name=f'n{n}')
+        for n in range(mask_types):
+            self.add_metric(1 - raw_losses[0, n], name=f'j{n}')
 
-        return p_detections
+        return p_targets
 
 
 def rgb_to_oklab(images):
@@ -254,7 +294,7 @@ def strong_model_parameters():
     return {
         'img_size': (512, 512),
         'filters': [24, 32, 64, 64, 64, 64, 128, 256],
-        'depth': 8,  # model trunk layers count
+        'depth': 12,  # model trunk layers count
         'resolution': 2,  # scaling factor of model trunk (2 ** resolution)
     }
 
@@ -288,17 +328,18 @@ class EncoderNN:
         filters = self.filters
 
         # inputs
-        in_img = layers.Input(shape=self.img_size + (3,), dtype=tf.float32, name='img')
+        in_img = layers.Input(shape=self.img_size + (3,), dtype=tf.float32, name='image')
 
         # intro
-        oklab = rgb_to_oklab(in_img)
+        #oklab = rgb_to_oklab(in_img)
+        oklab = in_img
 
         # downscale features
         x = scales * [None]
         size = oklab.shape[1]
         x[0] = oklab
         for n in range(1, scales):
-            size = size // 2
+            size = oklab.shape[1] // (2 ** n)
             x[n] = tf.image.resize(oklab, (size, size))
 
         # downscale
@@ -424,14 +465,15 @@ class DetectorNN:
     """
     Detector NN, semantic segmentation
     """
-    def __init__(self, load=None, parameters=None):
+    def __init__(self, load=None, parameters=None, logvars_init=None):
         """
         Initialize net
         """
-        self.detection_count = 3  # map, water, wet meadow
+        self.target_count = 4  # map, water, wet meadow, dry meadow
 
         self.model = None
         self.training_model = None
+        self.logvars_init = logvars_init
 
         # create / load model
         if load is None:
@@ -454,12 +496,12 @@ class DetectorNN:
         scales = encoder.scales
         filters = encoder.filters
         embedding =  encoder.model(in_img)[0]
-        detections = msf_block(embedding, [self.detection_count] + filters[0:scales - 1], 'up')[0]
+        predictions = msf_block(embedding, [self.target_count] + filters[0:scales - 1], 'up')[0]
 
         return tf.keras.Model(
             name='detector',
             inputs=[in_img],
-            outputs=[detections],
+            outputs=[predictions],
         )
 
 
@@ -467,29 +509,31 @@ class DetectorNN:
         """
         Create training models
         """
+        assert self.logvars_init is not None
+
         # inputs
-        in_img = layers.Input(shape=encoder.img_size + (3,), dtype=tf.float32, name='img')
-        in_detections = layers.Input(shape=encoder.img_size + (self.detection_count,), dtype=tf.float32, name='detections')
-        in_masks = layers.Input(shape=(self.detection_count,), dtype=tf.float32, name='masks')
+        in_img = layers.Input(shape=encoder.img_size + (3,), dtype=tf.float32, name='image')
+        in_targets = layers.Input(shape=encoder.img_size + (self.target_count,), dtype=tf.float32, name='targets')
+        in_masks = layers.Input(shape=(self.target_count,), dtype=tf.float32, name='masks')
 
         # models
         self.model = self.build_model(encoder, in_img)
 
         # outputs
-        p_detections = self.model(in_img)
+        p_targets = self.model(in_img)
 
         # losses
-        p_detections = SegmentationLoss()(in_masks, in_detections, p_detections)
+        p_targets = SegmentationLoss(self.logvars_init)(in_masks, in_targets, p_targets)
 
         # model for training
         self.training_model = tf.keras.Model(
             name='training_model',
-            inputs=[in_img, in_masks, in_detections],
-            outputs=[p_detections],
+            inputs=[in_img, in_masks, in_targets],
+            outputs=[p_targets],
         )
 
         # optimizer
-        self.training_model.compile(optimizer=tf.keras.optimizers.Adam(0.001))
+        self.training_model.compile(optimizer=tf.keras.optimizers.Adam(0.001), jit_compile=True)
 
 
     def predict(self, inputs):
@@ -519,8 +563,11 @@ class DetectorNN:
         """
         self.training_model = tf.keras.models.load_model(
             path,
-            custom_objects={'SegmentationLoss': SegmentationLoss},
+            custom_objects={
+                'SegmentationLoss': SegmentationLoss,
+            },
         )
+        self.training_model.compile(jit_compile=True)
         self.model = self.training_model.get_layer('detector')
 
 
@@ -909,15 +956,12 @@ def iterate_supervised(dataset_path, batch_size, masks, shuffle=True, augment=Tr
     # iterate through dataset
     batch_images = []
     batch_masks = []
-    batch_detections = []
+    batch_targets = []
     while True:
         if shuffle:
             random.shuffle(samples)
         for paths in samples:
             image_file = paths['image']
-            map_file = paths.get('map')
-            water_file = paths.get('water')
-            wetmeadow_file = paths.get('wetmeadow')
 
             # read images
             image = Image.open(image_file)
@@ -925,97 +969,68 @@ def iterate_supervised(dataset_path, batch_size, masks, shuffle=True, augment=Tr
             image = np.asarray(image)
             width, height = image.shape[:2]
 
-            masks = []
-
-            # read map
-            if map_file is None:
-                masks.append(0)
-                map_detection = np.zeros((width, height), np.uint8)
-            else:
-                masks.append(1)
-                map_detection = Image.open(map_file)
-                assert map_detection.mode == 'L'
-                map_detection = np.asarray(map_detection)
-
-            # read water
-            if water_file is None:
-                masks.append(0)
-                water_detection = np.zeros((width, height), np.uint8)
-            else:
-                masks.append(1)
-                water_detection = Image.open(water_file)
-                assert water_detection.mode == 'L'
-                water_detection = np.asarray(water_detection)
-
-            # read wetmeadow
-            if wetmeadow_file is None:
-                masks.append(0)
-                wetmeadow_detection = np.zeros((width, height), np.uint8)
-            else:
-                masks.append(1)
-                wetmeadow_detection = Image.open(wetmeadow_file)
-                assert wetmeadow_detection.mode == 'L'
-                wetmeadow_detection = np.asarray(wetmeadow_detection)
-
-            assert map_detection.shape == (width, height)
-            assert map_detection.shape == water_detection.shape
-            assert map_detection.shape == wetmeadow_detection.shape
-
-            # augment
+            # augment image
             if augment:
                 randaug = RandAug(2)
                 image = randaug.augment('image', image)
 
-                if map_file is not None:
-                    map_detection = randaug.augment('mask', map_detection)
-                    map_detection = (map_detection / 255).astype(np.float32)
+            # read masks
+            masks = []
+            mask_targets = []
+            contains_map = True
+            for mask in ['map', 'water', 'wetmeadow', 'drymeadow']:  # map must be first (contais_map)
+                mask_file = paths.get(mask)
+                if mask_file is None:
+                    if contains_map:
+                        masks.append(0)
+                    else:
+                        masks.append(1)  # no map == no other regions
+                    mask_target = np.zeros((width, height), np.float32)
+                else:
+                    masks.append(1)
+                    mask_target = Image.open(mask_file)
+                    assert mask_target.mode == 'L'
+                    mask_target = np.asarray(mask_target)
+                assert mask_target.shape == (width, height)
 
-                if water_file is not None:
-                    water_detection = randaug.augment('mask', water_detection)
-                    water_detection = (water_detection / 255).astype(np.float32)
+                # augment
+                if augment:
+                    if mask_file is not None:
+                        mask_target = randaug.augment('mask', mask_target)
+                        mask_target = mask_target.astype(np.float32) / 255
+                else:
+                    if mask_file is not None:
+                        mask_target = mask_target.astype(np.float32) / 255
 
-                if wetmeadow_file is not None:
-                    wetmeadow_detection = randaug.augment('mask', wetmeadow_detection)
-                    wetmeadow_detection = (wetmeadow_detection / 255).astype(np.float32)
-            else:
-                if map_file is not None:
-                    map_detection = map_detection.astype(np.float32) / 255
-                if water_file is not None:
-                    water_detection = water_detection.astype(np.float32) / 255
-                if wetmeadow_file is not None:
-                    wetmeadow_detection = wetmeadow_detection.astype(np.float32) / 255
+                # if there is no map region, other masks are not present as well
+                if mask == 'map' and mask_file is not None and np.sum(mask_target) == 0:
+                    contains_map = False
+
+                mask_targets.append(mask_target[..., None])
 
             # add to batch
-            batch_images.append(image)
-            batch_masks.append(masks)
-            batch_detections.append(
-                np.concatenate([
-                    map_detection[..., np.newaxis],
-                    water_detection[..., np.newaxis],
-                    wetmeadow_detection[..., np.newaxis],
-                ], axis=-1)
-            )
+            batch_images.append(image.astype(np.float32))
+            batch_masks.append(np.asarray(masks, dtype=np.float32))
+            batch_targets.append(np.concatenate(mask_targets, axis=-1))
 
             # yield batch
             if len(batch_images) == batch_size:
-                zeros = np.zeros((batch_size,))
-                yield [
-                    np.asarray(batch_images),
-                    np.asarray(batch_masks),
-                    np.asarray(batch_detections),
-                ], [zeros]
+                yield {
+                    'image': np.asarray(batch_images),
+                    'masks': np.asarray(batch_masks),
+                    'targets': np.asarray(batch_targets),
+                }
                 batch_images = []
                 batch_masks = []
-                batch_detections = []
+                batch_targets = []
 
         # yield the rest batch
         if batch_images:
-            zeros = np.zeros((batch_size,))
-            yield [
-                np.asarray(batch_images),
-                np.asarray(batch_masks),
-                np.asarray(batch_detections),
-            ], [zeros]
+            yield {
+                'image': np.asarray(batch_images),
+                'masks': np.asarray(batch_masks),
+                'targets': np.asarray(batch_targets),
+            }
             batch_images = []
             batch_masks = []
-            batch_detections = []
+            batch_targets = []

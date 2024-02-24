@@ -18,6 +18,9 @@ import cv2
 from PIL import Image, ImageOps
 import matplotlib.pyplot as plt
 import filelock
+import skimage
+import scipy
+from skimage.transform import probabilistic_hough_line
 
 if 'web' not in sys.path:
     sys.path.append('web')
@@ -126,6 +129,7 @@ def annotate_nnet(objects_path, images_path, annotated_path, model_path, include
             f'{object_id}_{image_id}_map',
             f'{object_id}_{image_id}_water',
             f'{object_id}_{image_id}_wetmeadow',
+            f'{object_id}_{image_id}_drymeadow',
         ]
         if output_names[0] in annotated:
             print(' * already done, skipping')
@@ -145,7 +149,10 @@ def annotate_nnet(objects_path, images_path, annotated_path, model_path, include
         try:
             image = np.array(image.resize((image_width // 4, image_height // 4)))
             detector = NNetDetector(model_path, image)
-            segments, masks, confidences, confidence_masks = detector.detect(return_confidence_masks=True)
+            segments, masks, confidences, confidence_masks, soft_masks = detector.detect(
+                return_confidence_masks=True,
+                return_soft_masks=True,
+            )
         finally:
             os.chdir('..')
         print(f' * detected {len(segments[0])} segments')
@@ -154,7 +161,7 @@ def annotate_nnet(objects_path, images_path, annotated_path, model_path, include
         print(' * writing results')
         for n in range(len(output_names)):
             with open(os.path.join(annotated_path, output_names[n]), 'wb') as fp:
-                image = Image.fromarray(masks[..., n] * 255)
+                image = Image.fromarray(soft_masks[..., n])
                 image = image.resize((image_width, image_height))
                 image.save(fp, format='PNG')
 
@@ -293,18 +300,41 @@ def find_edges(image):
     """
     # convert to oklab space
     image = rgb_to_oklab(image)
+
+    # find edges
     edges = image[..., 0]
     edges = edges - np.min(edges)
     edges = edges / np.max(edges)
     edges = edges * 255
     edges = edges.astype(np.uint8)
-    edges = np.minimum(cv2.Canny(edges, 50, 90), 1)
+    edges = np.minimum(cv2.Canny(edges, 70, 150), 1)
+    edges = edges.astype(bool)
 
-    # find edges
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel)
+    # fill gaps between edges
+    filled = edges
+    filled = skimage.morphology.binary_dilation(filled, skimage.morphology.disk(1))
+    filled = skimage.morphology.thin(filled, 3)
+    filled = filled & ~skimage.morphology.binary_erosion(filled, skimage.morphology.disk(1))
 
-    return edges
+
+    canvas = np.zeros_like(filled, dtype=np.uint8)
+    for n in range(3):
+        lines = probabilistic_hough_line(filled, line_length=15, line_gap=6)
+        for line in lines:
+            cv2.line(canvas, *line, 1)
+    filled = np.maximum(filled.astype(np.uint8), canvas)
+
+    filled = skimage.morphology.thin(filled, 1)
+    filled = filled & ~skimage.morphology.binary_erosion(filled, skimage.morphology.disk(1))
+
+    # fill thin diagonal lines
+    thin_diagonal = scipy.signal.convolve2d(filled, [[2, 3], [5, 7]], boundary='symm', mode='same')
+    thin_diagonal = np.logical_or(thin_diagonal == 8, thin_diagonal == 9)
+    thin_diagonal[:-1, :] |= thin_diagonal[1:, :]
+    thin_diagonal[:, :-1] |= thin_diagonal[:, 1:]
+    filled = filled | thin_diagonal
+
+    return filled
 
 
 def annotate_water(objects_path, images_path, annotated_path, include_path=None, random_order=False):
@@ -430,10 +460,10 @@ def annotate_manually(images_path, preannotated_path, annotated_path, image_path
         mask_path = None
         if mask is None:
             output_path = os.path.join(annotated_path, f'{picked}_generic')
-            tmp_path = os.path.join('/tmp', f'{picked}_generic.png')
+            tmp_path = os.path.join('/tmp', f'annotation_{picked}_generic.png')
         else:
             output_path = os.path.join(annotated_path, f'{picked}_{mask}')
-            tmp_path = os.path.join('/tmp', f'{picked}_{mask}.png')
+            tmp_path = os.path.join('/tmp', f'annotation_{picked}_{mask}.png')
     else:
         if mask is None:
             picked_name = to_annotate[picked][0]
@@ -441,32 +471,27 @@ def annotate_manually(images_path, preannotated_path, annotated_path, image_path
             picked_name = f'{picked}_{mask}'
         mask_path = os.path.join(preannotated_path, picked_name)
         output_path = os.path.join(annotated_path, picked_name)
-        tmp_path = os.path.join('/tmp', f'{picked_name}.png')
+        tmp_path = os.path.join('/tmp', f'annotation_{picked_name}.png')
     print('image', image_path)
     print('mask', mask_path)
     print('annotated', output_path)
     print('tmp', tmp_path)
     print()
 
-    try:
-        # open original image
-        thread = threading.Thread(target=lambda: subprocess.run(['eog', image_path]), daemon=True)
-        thread.start()
+    # open original image
+    thread = threading.Thread(target=lambda: subprocess.run(['eog', image_path]), daemon=True)
+    thread.start()
 
+    if not os.path.isfile(tmp_path):
         print('masking original image')
         image = Image.open(image_path)
         if show == 'edges':
-            #mask = np.array(Image.open(mask_path))
-            mask = find_edges(image)
-            mask = 1 - mask
-            mask = 255 * mask
-            mask = mask[..., np.newaxis]
-            image = np.concatenate([image, mask], axis=2)
-            """
-            image = mask // 2
-            image = image - 1
-            image = np.maximum(mask, edges)
-            """
+            emphasize_intensity = 50
+            image = np.array(image)
+            edges = find_edges(image)[..., None]
+            alpha = 255 * np.ones_like(edges, dtype=np.uint8)
+            image = np.where(edges, np.maximum(emphasize_intensity, image) - emphasize_intensity, image)
+            image = np.concatenate([image, alpha], axis=2)
         elif show in ('mask', 'inverted_mask'):
             mask = np.array(Image.open(mask_path))
             mask = mask[..., np.newaxis]
@@ -482,54 +507,43 @@ def annotate_manually(images_path, preannotated_path, annotated_path, image_path
         image = Image.fromarray(image)
         image.save(tmp_path, format='png')
 
-        print('manual annotion')
-        subprocess.run([paint, tmp_path])
+    print('manual annotion')
+    subprocess.run([paint, tmp_path])
 
-        print('extracting mask')
-        image = Image.open(tmp_path)
-        assert image.mode == 'RGBA', image.mode
-        if show == 'edges':
-            _, _, image, _ = image.split()
-            image = Image.fromarray(np.array(image) > 200)
-        elif show == 'mask':
-            _, _, _, image = image.split()
-            image = Image.fromarray(np.array(image) > 127)
-        elif show == 'inverted_mask':
-            _, _, _, image = image.split()
-            image = Image.fromarray(np.array(image) <= 127)
-        elif show == 'nothing':
-            _, _, _, image = image.split()
-            image = Image.fromarray(np.array(image) <= 127)
-        image.save(tmp_path, format='png')
+    print('extracting mask')
+    image = Image.open(tmp_path)
+    assert image.mode == 'RGBA', image.mode
+    if show == 'edges':
+        _, _, _, image = image.split()
+        image = Image.fromarray(np.array(image) <= 127)
+    elif show == 'mask':
+        _, _, _, image = image.split()
+        image = Image.fromarray(np.array(image) > 127)
+    elif show == 'inverted_mask':
+        _, _, _, image = image.split()
+        image = Image.fromarray(np.array(image) <= 127)
+    elif show == 'nothing':
+        _, _, _, image = image.split()
+        image = Image.fromarray(np.array(image) <= 127)
+    image.save(tmp_path, format='png')
 
-        print('post-processing')
-        image = Image.open(tmp_path)
-        if show == 'edges':
-            image = ImageOps.grayscale(image)
-            image = np.asarray(image)
-            image = 255 - image
-            image = remove_thin_structures(image, 5)
-            image = 255 - image
-        elif show in ('mask', 'inverted_mask', 'nothing'):
-            image = Image.open(tmp_path)
-            image = ImageOps.grayscale(image)
-            image = remove_thin_structures(np.asarray(image), 7)
-        image = Image.fromarray(image)
-        image.save(tmp_path, format='png')
+    print('post-processing')
+    image = Image.open(tmp_path)
+    image = ImageOps.grayscale(image)
+    image = remove_thin_structures(np.asarray(image), 5)
+    image = Image.fromarray(image)
+    image.save(tmp_path, format='png')
 
-        print('manual correction')
-        subprocess.run(['pinta', tmp_path])
+    print('manual correction')
+    subprocess.run(['pinta', tmp_path])
 
-        print('converting to grayscale')
-        image = Image.open(tmp_path)
-        image = ImageOps.grayscale(image)
-        image = Image.fromarray(np.asarray(image))
-        image.save(output_path, format='png')
-    finally:
-        try:
-            os.remove(tmp_path)
-        except FileNotFoundError:
-            pass  # ignore
+    print('converting to grayscale')
+    image = Image.open(tmp_path)
+    image = ImageOps.grayscale(image)
+    image = Image.fromarray(np.asarray(image))
+    image.save(output_path, format='png')
+
+    os.remove(tmp_path)
 
 
 def check_annotations(images_path, annotated_path, show_pair):
@@ -569,7 +583,6 @@ def check_annotations(images_path, annotated_path, show_pair):
             non_masked = (mask * image).astype(np.uint8)
             image_tn = masked_color + masked_original + non_masked
             image = np.hstack([image_tp, image_tn])
-            image = image_tn
         else:
             image = image_tp
 
@@ -649,6 +662,9 @@ def select_confidence_column(images, groups, selected, beam_size, column):
     """
     Select image from given column
     """
+    if not images:
+        return
+
     preselected = heapq.nlargest(beam_size, images.items(), key=lambda item: -np.mean(item[1]))
     chosen = preselected[min(  # argmin
         range(len(preselected)),
@@ -664,11 +680,29 @@ def select_confidence_column(images, groups, selected, beam_size, column):
             pass  # already excluded
 
 
-def sort_confidence(annotated_path, count):
+def sort_confidence(annotated_path, count, mask, exclude_path):
     """
     Sort automatic annotations according to prediction confidence
     """
+    masks = {
+        'map': 0,
+        'water': 1,
+        'wetmeadow': 2,
+        'drymeadow': 3,
+    }
+    assert mask is None or mask in masks
+
     meta_path = os.path.join(annotated_path, 'meta.json')
+
+    if exclude_path is None:
+        exclusions = set()
+    else:
+        exclusions = []
+        for path in os.listdir(exclude_path):
+            name, mask_type = path.rsplit('_', 1)
+            if mask is None or mask_type == mask:
+                exclusions.append(name)
+        exclusions = set(exclusions)
 
     # load confidence scores
     with filelock.FileLock(f'{meta_path}.lock'):
@@ -680,7 +714,7 @@ def sort_confidence(annotated_path, count):
     mean_confidences = np.mean([confidence[1:] for confidence in confidences], axis=0)
     print('mean confidences', mean_confidences)
 
-    images = {confidence[0]: confidence[1:] for confidence in confidences}
+    images = {confidence[0]: confidence[1:] for confidence in confidences if confidence[0] not in exclusions}
     groups = {}
     for confidence in confidences:
         image = confidence[0]
@@ -690,10 +724,15 @@ def sort_confidence(annotated_path, count):
     # beam search
     beam_size = max(1, len(images) // 10)
     selected = []
-    for n in range(math.ceil(count / 3)):
-        select_confidence_column(images, groups, selected, beam_size, 0)  # map
-        select_confidence_column(images, groups, selected, beam_size, 1)  # water
-        select_confidence_column(images, groups, selected, beam_size, 2)  # wet meadow
+    if mask is None:
+        for n in range(math.ceil(count / len(masks))):
+            select_confidence_column(images, groups, selected, beam_size, 0)  # map
+            select_confidence_column(images, groups, selected, beam_size, 1)  # water
+            select_confidence_column(images, groups, selected, beam_size, 2)  # wet meadow
+            select_confidence_column(images, groups, selected, beam_size, 3)  # dry meadow
+    else:
+        for n in range(count):
+            select_confidence_column(images, groups, selected, beam_size, masks[mask])
 
     # print results
     for image, confidence in selected:
@@ -848,6 +887,8 @@ def main():
     parser_confidence = subparsers.add_parser('confidence', help='sort automatic annotations accoding to prediction confidence')
     parser_confidence.add_argument('annotated_path', help='path with annotations')
     parser_confidence.add_argument('--count', type=int, default=10, help='number of images to select')
+    parser_confidence.add_argument('--mask', default=None, help='sort only confidences for given mask')
+    parser_confidence.add_argument('--exclude', default=None, help='exclude masks on given path')
 
     parser_dataset = subparsers.add_parser('dataset', help='annotate compiled dataset with model annotations')
     parser_dataset.add_argument('dataset_path', help='path with already annotated dataset')
@@ -871,7 +912,7 @@ def main():
     elif args.mode == 'unannotated':
         show_unannotated(args.images_path, args.annotated_path, args.mask, args.random)
     elif args.mode == 'confidence':
-        sort_confidence(args.annotated_path, args.count)
+        sort_confidence(args.annotated_path, args.count, args.mask, args.exclude)
     elif args.mode == 'dataset':
         annotate_dataset(args.dataset_path, args.results_path, args.model)
     else:
