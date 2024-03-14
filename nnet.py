@@ -207,6 +207,7 @@ def msf_block(inputs, filters, scale='same'):
     assert len(inputs) == len(filters)
     assert scale in ('down', 'up', 'same')
 
+    # pre-convolution
     scales = len(inputs)
     x = scales * [None]
     for n in range(scales):
@@ -257,6 +258,7 @@ def msf_block(inputs, filters, scale='same'):
             else:
                 merged[n] += tf.image.resize(x[n + 1][..., :filter_count], (size, size))
 
+    # post-convolution
     for n in range(scales):
         # projection
         x[n] = layers.Conv2D(filters[n], 1, padding='valid')(merged[n])
@@ -281,7 +283,7 @@ def fast_model_parameters():
     """
     return {
         'img_size': (512, 512),
-        'filters': [24, 32, 64, 64, 64, 64, 128, 256],
+        'filters': [24, 32, 64, 64, 128, 256],
         'depth': 6,  # model trunk layers count
         'resolution': 3,  # scaling factor of model trunk (2 ** resolution)
     }
@@ -293,8 +295,8 @@ def strong_model_parameters():
     """
     return {
         'img_size': (512, 512),
-        'filters': [24, 32, 64, 64, 64, 64, 128, 256],
-        'depth': 12,  # model trunk layers count
+        'filters': [24, 32, 64, 128, 226, 512],
+        'depth': 10,  # model trunk layers count
         'resolution': 2,  # scaling factor of model trunk (2 ** resolution)
     }
 
@@ -328,19 +330,15 @@ class EncoderNN:
         filters = self.filters
 
         # inputs
-        in_img = layers.Input(shape=self.img_size + (3,), dtype=tf.float32, name='image')
-
-        # intro
-        #oklab = rgb_to_oklab(in_img)
-        oklab = in_img
+        in_image = layers.Input(shape=self.img_size + (3,), dtype=tf.float32, name='image')
 
         # downscale features
         x = scales * [None]
-        size = oklab.shape[1]
-        x[0] = oklab
+        size = in_image.shape[1]
+        x[0] = in_image
         for n in range(1, scales):
-            size = oklab.shape[1] // (2 ** n)
-            x[n] = tf.image.resize(oklab, (size, size))
+            size = in_image.shape[1] // (2 ** n)
+            x[n] = tf.image.resize(in_image, (size, size))
 
         # downscale
         for scale in range(self.resolution):
@@ -358,7 +356,7 @@ class EncoderNN:
         # encoder
         self.model = tf.keras.Model(
             name='encoder',
-            inputs=[in_img],
+            inputs=[in_image],
             outputs=[x],
         )
 
@@ -495,6 +493,7 @@ class DetectorNN:
         # add detection head
         scales = encoder.scales
         filters = encoder.filters
+
         embedding =  encoder.model(in_img)[0]
         predictions = msf_block(embedding, [self.target_count] + filters[0:scales - 1], 'up')[0]
 
@@ -630,13 +629,13 @@ class RandAug:
             'identity': [1, RandAug.augment_identity, None],
             #'invert': [1, RandAug.augment_invert, None],
             'contrast': [0.8, RandAug.augment_contrast, None],
-            'brightness': [0.3, RandAug.augment_brightness, None],
+            'brightness': [0.1, RandAug.augment_brightness, None],
             'sharpness': [0.9, RandAug.augment_sharpness, None],
             #'affine': [1, RandAug.augment_affine, None],
             #'blobs': [1, RandAug.augment_blobs, None],
             'flip': [1, RandAug.augment_flip, None],
             'rotate': [1, RandAug.augment_rotate, None],
-            'noise': [0.5, RandAug.augment_noise, None],
+            'noise': [0.2, RandAug.augment_noise, None],
         }
 
         if transforms is not None:

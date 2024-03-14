@@ -11,7 +11,8 @@ import heapq
 import math
 import shutil
 import tarfile
-from multiprocessing import Process
+import multiprocessing
+import functools
 
 import numpy as np
 import cv2
@@ -147,7 +148,7 @@ def annotate_nnet(objects_path, images_path, annotated_path, model_path, include
         print(f' * detecting maps from image {image_width} x {image_height}')
         os.chdir('web')
         try:
-            image = np.array(image.resize((image_width // 4, image_height // 4)))
+            image = np.array(image.resize((image_width // 4, image_height // 4), Image.LANCZOS))
             detector = NNetDetector(model_path, image)
             segments, masks, confidences, confidence_masks, soft_masks = detector.detect(
                 return_confidence_masks=True,
@@ -162,12 +163,12 @@ def annotate_nnet(objects_path, images_path, annotated_path, model_path, include
         for n in range(len(output_names)):
             with open(os.path.join(annotated_path, output_names[n]), 'wb') as fp:
                 image = Image.fromarray(soft_masks[..., n])
-                image = image.resize((image_width, image_height))
+                image = image.resize((image_width, image_height), Image.LANCZOS)
                 image.save(fp, format='PNG')
 
             with open(os.path.join(annotated_path, output_names[n] + '-confidence'), 'wb') as fp:
                 image = Image.fromarray(confidence_masks[..., n] * 255)
-                image = image.resize((image_width, image_height))
+                image = image.resize((image_width, image_height), Image.LANCZOS)
                 image.save(fp, format='PNG')
 
         # save confidences
@@ -530,7 +531,7 @@ def annotate_manually(images_path, preannotated_path, annotated_path, image_path
     print('post-processing')
     image = Image.open(tmp_path)
     image = ImageOps.grayscale(image)
-    image = remove_thin_structures(np.asarray(image), 5)
+    image = remove_thin_structures(np.asarray(image), 3)
     image = Image.fromarray(image)
     image.save(tmp_path, format='png')
 
@@ -740,58 +741,100 @@ def sort_confidence(annotated_path, count, mask, exclude_path):
     print('selected mean confidence', np.mean([confidence[1] for confidence in selected], axis=0))
 
 
-def annotate_dataset_path(dataset_path, results_path, model_path):
+def annotate_dataset_init(model_path):
+    """
+    Initialize dataset annotation worker
+    """
+    global annotate_dataset_model
+
+    # load model
+    annotate_dataset_model = TFLiteModel(model_path)
+
+
+def annotate_dataset_step(dataset_path, results_path, sample):
+    """
+    Annotate dataset with one step
+    """
+    global annotate_dataset_model
+
+    image_path = sample['image'][0]
+    warp_path = sample['warp'][0]
+    image_base_path = image_path.rsplit('_', 1)[0]
+
+    # info
+    sample_info = {
+        'image': (image_path, 0),
+        'map': (f'{image_base_path}_map', 0),
+        'water': (f'{image_base_path}_water', 0),
+        'wetmeadow': (f'{image_base_path}_wetmeadow', 0),
+        'drymeadow': (f'{image_base_path}_drymeadow', 0),
+    }
+
+    # check for existing results
+    try:
+        if all(
+            os.stat(os.path.join(results_path, path)).st_size > 0
+            for path in [
+                sample_info['image'][0],
+                sample_info['map'][0],
+                sample_info['water'][0],
+                sample_info['wetmeadow'][0],
+                sample_info['drymeadow'][0],
+            ]
+        ):
+            return sample_info
+    except FileNotFoundError:
+        pass  # files do not  exist, create new ones
+
+    # load images
+    image = np.asarray(Image.open(os.path.join(dataset_path, image_path)))
+    warp = np.asarray(Image.open(os.path.join(dataset_path, warp_path)))
+
+    # predict
+    predictions = annotate_dataset_model.predict(image)
+    predictions = np.clip(predictions, 0, 1, predictions) * 255
+    predictions = predictions.astype(np.uint8)
+
+    map_prediction = np.minimum(predictions[..., 0], warp)
+    water_prediction = np.minimum(predictions[..., 1], warp)
+    wetmeadow_prediction = np.minimum(predictions[..., 2], warp)
+    drymeadow_prediction = np.minimum(predictions[..., 3], warp)
+
+    # save images
+    shutil.copyfile(os.path.join(dataset_path, image_path), os.path.join(results_path, image_path))
+    Image.fromarray(map_prediction).save(os.path.join(results_path, sample_info['map'][0]), format='png')
+    Image.fromarray(water_prediction).save(os.path.join(results_path, sample_info['water'][0]), format='png')
+    Image.fromarray(wetmeadow_prediction).save(os.path.join(results_path, sample_info['wetmeadow'][0]), format='png')
+    Image.fromarray(drymeadow_prediction).save(os.path.join(results_path, sample_info['drymeadow'][0]), format='png')
+
+    return sample_info
+
+
+def annotate_dataset_path(dataset_path, results_path, model_path, remove_existing):
     """
     Annotate compile dataset on specified path
     """
-    # create output folder
-    try:
-        shutil.rmtree(results_path)
-    except FileNotFoundError:
-        pass
-    os.makedirs(results_path, exist_ok=True)
+    if remove_existing:
+        # create output folder
+        try:
+            shutil.rmtree(results_path)
+        except FileNotFoundError:
+            pass
+        os.makedirs(results_path, exist_ok=True)
 
     with open(os.path.join(dataset_path, 'info.json')) as fp:
         info = json.load(fp)
 
-    # load model
-    model = TFLiteModel(model_path)
+    # create processing pool
+    cores = multiprocessing.cpu_count()
+    pool = multiprocessing.Pool(max(1, cores - 1), initializer=annotate_dataset_init, initargs=(model_path,))
 
-    # iterat samples
+    # iterate samples
     new_info = []
-    for n, sample in enumerate(info['samples']):
+    process_fn = functools.partial(annotate_dataset_step, dataset_path, results_path)
+    for n, sample_info in enumerate(pool.imap_unordered(process_fn, info['samples'], 1)):
         print(f'\r{results_path} {n + 1}', end='')
-        image_path = sample['image'][0]
-        warp_path = sample['warp'][0]
-        image_base_path = image_path.rsplit('_', 1)[0]
-
-        # load images
-        image = np.asarray(Image.open(os.path.join(dataset_path, image_path)))
-        warp = np.asarray(Image.open(os.path.join(dataset_path, warp_path)))
-
-        # predict
-        predictions = model.predict(image)
-        predictions = np.clip(predictions, 0, 1, predictions) * 255
-        predictions = predictions.astype(np.uint8)
-
-        map_prediction = np.minimum(predictions[..., 0], warp)
-        water_prediction = np.minimum(predictions[..., 1], warp)
-        wetmeadow_prediction = np.minimum(predictions[..., 2], warp)
-
-        # info
-        sample_info = {
-            'image': (image_path, 0),
-            'map': (f'{image_base_path}_map', 0),
-            'water': (f'{image_base_path}_water', 0),
-            'wetmeadow': (f'{image_base_path}_wetmeadow', 0),
-        }
         new_info.append(sample_info)
-
-        # save images
-        shutil.copyfile(os.path.join(dataset_path, image_path), os.path.join(results_path, image_path))
-        Image.fromarray(map_prediction).save(os.path.join(results_path, sample_info['map'][0]), format='png')
-        Image.fromarray(water_prediction).save(os.path.join(results_path, sample_info['water'][0]), format='png')
-        Image.fromarray(wetmeadow_prediction).save(os.path.join(results_path, sample_info['wetmeadow'][0]), format='png')
     print()
 
     # write new info
@@ -799,26 +842,12 @@ def annotate_dataset_path(dataset_path, results_path, model_path):
         json.dump({'samples': new_info}, fp)
 
 
-def annotate_dataset(dataset_path, results_path, model_path):
+def annotate_dataset(dataset_path, results_path, model_path, remove_existing):
     """
     Annotate compiled dataset
     """
-    train_process = Process(
-        target=annotate_dataset_path,
-        args=(os.path.join(dataset_path, 'train'), os.path.join(results_path, 'train'), model_path),
-    )
-    train_process.start()
-    val_process = Process(
-        target=annotate_dataset_path,
-        args=(os.path.join(dataset_path, 'val'), os.path.join(results_path, 'val'), model_path),
-    )
-    val_process.start()
-
-    train_process.join()
-    val_process.join()
-
-    #annotate_dataset_path(os.path.join(dataset_path, 'train'), os.path.join(results_path, 'train'), model_path)
-    #annotate_dataset_path(os.path.join(dataset_path, 'val'), os.path.join(results_path, 'val'), model_path)
+    annotate_dataset_path(os.path.join(dataset_path, 'train'), os.path.join(results_path, 'train'), model_path, remove_existing)
+    annotate_dataset_path(os.path.join(dataset_path, 'val'), os.path.join(results_path, 'val'), model_path, remove_existing)
 
     # tar dataset
     results_name = results_path.strip(os.sep).split(os.sep)[-1]
@@ -894,6 +923,7 @@ def main():
     parser_dataset.add_argument('dataset_path', help='path with already annotated dataset')
     parser_dataset.add_argument('results_path', help='path where new dataset should be created')
     parser_dataset.add_argument('--model', required=True, help='model to be used for annotating dataset')
+    parser_dataset.add_argument('--remove-existing', action='store_true', help='remove already existing results')
 
     args = argparser.parse_args()
 
@@ -914,7 +944,7 @@ def main():
     elif args.mode == 'confidence':
         sort_confidence(args.annotated_path, args.count, args.mask, args.exclude)
     elif args.mode == 'dataset':
-        annotate_dataset(args.dataset_path, args.results_path, args.model)
+        annotate_dataset(args.dataset_path, args.results_path, args.model, args.remove_existing)
     else:
         assert False
 
