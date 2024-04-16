@@ -1,6 +1,6 @@
 requests
-jupyter
 matplotlib
+jupyterlab
 opencv-python
 opencv-contrib-python
 scikit-image
@@ -8,3 +8,4 @@ numba
 tensorflow
 tf2onnx
 filelock
+scikit-learn

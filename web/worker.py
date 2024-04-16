@@ -58,13 +58,27 @@ def save_image(image, name, output_format, zip_file):
             image.save(image_bytes, format='webp')
             zip_file.writestr(f'{name}.webp', image_bytes.getvalue())
     elif output_format == 'jpg':
-        background = np.asarray([[(255, 255, 255)]], dtype=np.uint8)
-        image = np.where(image[..., 3:] == 255, image[..., :3], background)
         image = Image.fromarray(image)
-        #image = numpy_to_pil(image[..., :3], 'RGB')
+        masked_image = Image.new('RGBA', image.size, 'white')
+        masked_image.paste(image, (0, 0), image)
+        masked_image = masked_image.convert('RGB')
         with io.BytesIO() as image_bytes:
-            image.save(image_bytes, format='jpeg', quality=90, optimize=True)
+            masked_image.save(image_bytes, format='jpeg', quality=90, optimize=True)
             zip_file.writestr(f'{name}.jpg', image_bytes.getvalue())
+    elif output_format == 'multi':
+        # webp
+        with io.BytesIO() as image_bytes:
+            image = Image.fromarray(image)
+            image.save(image_bytes, format='webp')
+            zip_file.writestr(f'{name}.webp', image_bytes.getvalue())
+
+        # jpg
+        masked_image = Image.new('RGBA', image.size, 'white')
+        masked_image.paste(image, (0, 0), image)
+        masked_image = masked_image.convert('RGB')
+        with io.BytesIO() as image_bytes:
+            masked_image.save(image_bytes, format='jpeg', quality=90, optimize=True)
+            zip_file.writestr(f'jpg/{name}.jpg', image_bytes.getvalue())
 
 
 def process(job_id, detector_type, output_format):
@@ -72,7 +86,7 @@ def process(job_id, detector_type, output_format):
     Extract map parts
     """
     assert detector_type in ('nnet', ), f'Unsupported detector type {detector_type}'
-    assert output_format in ('png', 'webp', 'jpg'), f'Unsupported output format {output_format}'
+    assert output_format in ('png', 'webp', 'jpg', 'multi'), f'Unsupported output format {output_format}'
 
     try:
         job_path = os.path.join('jobs', job_id)
@@ -83,8 +97,6 @@ def process(job_id, detector_type, output_format):
         # decode image
         try:
             image = Image.open(job_path)
-            image_width = image.width
-            image_height = image.height
         except Exception:
             raise RuntimeError('Nedokážu přečíst nahrávaný soubor, zpracuju jenom .png a .jpg obrázky.')
 
@@ -107,7 +119,7 @@ def process(job_id, detector_type, output_format):
         else:
             resize_ratio = None
         if resize_ratio is not None:
-            image = image.resize((image.width // resize_ratio, image.height // resize_ratio), Image.BICUBIC)
+            image = image.resize((image.width // resize_ratio, image.height // resize_ratio), Image.LANCZOS)
 
         # add transparency if necessary
         if image.mode == 'RGB':
@@ -133,7 +145,8 @@ def process(job_id, detector_type, output_format):
         map_index = 0
         water_index = 1
         wetmeadow_index = 2
-        names = ['mapa', 'voda', 'mokre_louky']
+        drymeadow_index = 3
+        names = ['mapa', 'voda', 'mokre_louky', 'suche_louky']
 
         if detector_type == 'nnet':
             detector = NNetDetector('model_nnet.tflite', image)
@@ -162,8 +175,8 @@ def process(job_id, detector_type, output_format):
                 del map_image
                 gc.collect()
 
-                # find all water chunks inside current map segment
-                for mask_index in [water_index, wetmeadow_index]:
+                # find all target chunks inside current map segment
+                for mask_index in [water_index, wetmeadow_index, drymeadow_index]:
                     # draw mask image
                     mask_image = None
                     for p, mask_segment in enumerate(segments[mask_index]):
@@ -196,6 +209,14 @@ def process(job_id, detector_type, output_format):
                     for b in range(250, 256)
                 )
                 zip_file.writestr('pozadi.txt', background_colors)
+            elif output_format == 'multi':
+                background_colors = '\n'.join(
+                    f'{r} {g} {b} 100'
+                    for r in range(250, 256)
+                    for g in range(250, 256)
+                    for b in range(250, 256)
+                )
+                zip_file.writestr('jpg/pozadi.txt', background_colors)
 
         del detector
         del image

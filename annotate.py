@@ -547,7 +547,7 @@ def annotate_manually(images_path, preannotated_path, annotated_path, image_path
     os.remove(tmp_path)
 
 
-def check_annotations(images_path, annotated_path, show_pair):
+def check_annotations(images_path, annotated_path, show):
     """
     Check image annotatations
     """
@@ -569,23 +569,28 @@ def check_annotations(images_path, annotated_path, show_pair):
         shape = image.shape
         image = cv2.resize(image, (shape[1] // 2, shape[0] // 2))
         mask = cv2.resize(mask, (shape[1] // 2, shape[0] // 2))
-        mask = mask[..., np.newaxis]
-        mask = mask / 255
 
-        color = (128, 0, 255)
-        masked_original = (0.5 * mask * image).astype(np.uint8)
-        masked_color = (0.5 * mask * [[color]]).astype(np.uint8)
-        non_masked = ((1 - mask) * image).astype(np.uint8)
-        image_tp = masked_color + masked_original + non_masked
+        if show in ('blended_pair', 'blended'):
+            mask = mask[..., np.newaxis]
+            mask = mask / 255
+            color = (128, 0, 255)
+            masked_original = (0.5 * mask * image).astype(np.uint8)
+            masked_color = (0.5 * mask * [[color]]).astype(np.uint8)
+            non_masked = ((1 - mask) * image).astype(np.uint8)
+            image_tp = masked_color + masked_original + non_masked
 
-        if show_pair:
+        if show == 'blended_pair':
             masked_original = (0.5 * (1 - mask) * image).astype(np.uint8)
             masked_color = (0.5 * (1 - mask) * [[color]]).astype(np.uint8)
             non_masked = (mask * image).astype(np.uint8)
             image_tn = masked_color + masked_original + non_masked
             image = np.hstack([image_tp, image_tn])
-        else:
+        elif show == 'blended':
             image = image_tp
+        elif show == 'pair':
+            image = np.hstack([image, mask[..., None] * np.ones((1, 1, 3), np.uint8)])
+        else:
+            assert False
 
         image = Image.fromarray(image)
         image.save(tmp_path, format='png')
@@ -599,7 +604,7 @@ def check_annotations(images_path, annotated_path, show_pair):
             pass  # ignore
 
 
-def check_annotations_dir(images_path, annotated_path, mask_type, excluded_path, random_order, show_pair):
+def check_annotations_dir(images_path, annotated_path, mask_type, excluded_path, random_order, show):
     """
     Check image annotatations in the whole directory
     """
@@ -631,7 +636,7 @@ def check_annotations_dir(images_path, annotated_path, mask_type, excluded_path,
             continue
 
         mask_path = os.path.join(annotated_path, mask_name)
-        check_annotations(images_path, mask_path, show_pair)
+        check_annotations(images_path, mask_path, show)
 
         print(done_path)
         with open(done_path, 'a') as fp:
@@ -757,17 +762,17 @@ def annotate_dataset_step(dataset_path, results_path, sample):
     """
     global annotate_dataset_model
 
-    image_path = sample['image'][0]
-    warp_path = sample['warp'][0]
+    image_path = sample['image']
+    warp_path = sample['warp']
     image_base_path = image_path.rsplit('_', 1)[0]
 
     # info
     sample_info = {
-        'image': (image_path, 0),
-        'map': (f'{image_base_path}_map', 0),
-        'water': (f'{image_base_path}_water', 0),
-        'wetmeadow': (f'{image_base_path}_wetmeadow', 0),
-        'drymeadow': (f'{image_base_path}_drymeadow', 0),
+        'image': image_path,
+        'map': f'{image_base_path}_map',
+        'water': f'{image_base_path}_water',
+        'wetmeadow': f'{image_base_path}_wetmeadow',
+        'drymeadow': f'{image_base_path}_drymeadow',
     }
 
     # check for existing results
@@ -775,11 +780,11 @@ def annotate_dataset_step(dataset_path, results_path, sample):
         if all(
             os.stat(os.path.join(results_path, path)).st_size > 0
             for path in [
-                sample_info['image'][0],
-                sample_info['map'][0],
-                sample_info['water'][0],
-                sample_info['wetmeadow'][0],
-                sample_info['drymeadow'][0],
+                sample_info['image'],
+                sample_info['map'],
+                sample_info['water'],
+                sample_info['wetmeadow'],
+                sample_info['drymeadow'],
             ]
         ):
             return sample_info
@@ -802,10 +807,10 @@ def annotate_dataset_step(dataset_path, results_path, sample):
 
     # save images
     shutil.copyfile(os.path.join(dataset_path, image_path), os.path.join(results_path, image_path))
-    Image.fromarray(map_prediction).save(os.path.join(results_path, sample_info['map'][0]), format='png')
-    Image.fromarray(water_prediction).save(os.path.join(results_path, sample_info['water'][0]), format='png')
-    Image.fromarray(wetmeadow_prediction).save(os.path.join(results_path, sample_info['wetmeadow'][0]), format='png')
-    Image.fromarray(drymeadow_prediction).save(os.path.join(results_path, sample_info['drymeadow'][0]), format='png')
+    Image.fromarray(map_prediction).save(os.path.join(results_path, sample_info['map']), format='png')
+    Image.fromarray(water_prediction).save(os.path.join(results_path, sample_info['water']), format='png')
+    Image.fromarray(wetmeadow_prediction).save(os.path.join(results_path, sample_info['wetmeadow']), format='png')
+    Image.fromarray(drymeadow_prediction).save(os.path.join(results_path, sample_info['drymeadow']), format='png')
 
     return sample_info
 
@@ -827,7 +832,7 @@ def annotate_dataset_path(dataset_path, results_path, model_path, remove_existin
 
     # create processing pool
     cores = multiprocessing.cpu_count()
-    pool = multiprocessing.Pool(max(1, cores - 1), initializer=annotate_dataset_init, initargs=(model_path,))
+    pool = multiprocessing.Pool(max(1, cores), initializer=annotate_dataset_init, initargs=(model_path,))
 
     # iterate samples
     new_info = []
@@ -897,7 +902,7 @@ def main():
     parser_check = subparsers.add_parser('check', help='check annotated images')
     parser_check.add_argument('images_path', help='path with images')
     parser_check.add_argument('annotated_path', help='path with annotated mask')
-    parser_check.add_argument('--show-pair', action='store_true', help='show image and mask')
+    parser_check.add_argument('--show', default='blended_pair', choices=['blended', 'blended_pair', 'pair'], help='how to show image and mask')
 
     parser_check_dir = subparsers.add_parser('check-dir', help='check annotated images in directory')
     parser_check_dir.add_argument('images_path', help='path with images')
@@ -905,7 +910,7 @@ def main():
     parser_check_dir.add_argument('--mask', required=True, help='show chosen mask type')
     parser_check_dir.add_argument('--exclude', default=None, help='exclude images in given dir')
     parser_check_dir.add_argument('--random', action='store_true', help='show annotations in random order')
-    parser_check_dir.add_argument('--show-pair', action='store_true', help='show image and mask')
+    parser_check_dir.add_argument('--show', default='blended_pair', choices=['blended', 'blended_pair', 'pair'], help='how to show image and mask')
 
     parser_unannotated = subparsers.add_parser('unannotated', help='show images that are not annotated')
     parser_unannotated.add_argument('images_path', help='path with images')
@@ -936,9 +941,9 @@ def main():
     elif args.mode == 'manual':
         annotate_manually(args.images_path, args.preannotated_path, args.annotated_path, args.image, args.mask, args.show, args.paint)
     elif args.mode == 'check':
-        check_annotations(args.images_path, args.annotated_path, args.show_pair)
+        check_annotations(args.images_path, args.annotated_path, args.show)
     elif args.mode == 'check-dir':
-        check_annotations_dir(args.images_path, args.annotated_path, args.mask, args.exclude, args.random, args.show_pair)
+        check_annotations_dir(args.images_path, args.annotated_path, args.mask, args.exclude, args.random, args.show)
     elif args.mode == 'unannotated':
         show_unannotated(args.images_path, args.annotated_path, args.mask, args.random)
     elif args.mode == 'confidence':

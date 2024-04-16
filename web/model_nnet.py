@@ -12,7 +12,7 @@ from model import Detector
 class TFLiteModel:
 
     def __init__(self, path):
-        self.thresholds = (0.60, 0.64, 0.58)
+        self.thresholds = (0.42, 0.62, 0.48, 0.62)
 
         self.interpreter = tflite.Interpreter(model_path=path)
         self.interpreter.allocate_tensors()
@@ -27,7 +27,7 @@ class TFLiteModel:
         for out in self.interpreter.get_output_details():
             outputs[out['name']] = out
 
-        self.in_img = inputs['serving_default_img:0']
+        self.in_img = inputs['serving_default_image:0']
         self.p_out = outputs['StatefulPartitionedCall:0']
 
 
@@ -65,11 +65,12 @@ class NNetDetector(Detector):
         self.model = TFLiteModel(model_path)
 
 
-    def detect(self, progress_callback=None, return_confidence_masks=False):
+    def detect(self, progress_callback=None, return_confidence_masks=False, return_soft_masks=False):
         """
         Detect map segments
         Returns segments, masks
         """
+        prediction_count = len(self.model.thresholds)
         chunk_size = 512
         overlap = chunk_size // 2
 
@@ -77,19 +78,23 @@ class NNetDetector(Detector):
 
         # check for too small images
         if self.image_width < chunk_size or self.image_height < chunk_size:
-            masks = np.zeros((*image.shape[:2], 3), np.uint8)
-            segments = [[], [], []]
+            masks = np.zeros((*image.shape[:2], prediction_count), np.uint8)
+            segments = prediction_count * [[]]
+            confidence_values = np.ones((prediction_count,))
+            ret = [segments, masks, confidence_values]
             if return_confidence_masks:
-                return segments, masks, np.ones((3,)), np.zeros((*image.shape[:2], 3), np.uint8)
-            else:
-                return segments, masks, np.ones((3,))
+                ret.append(masks)
+            if return_soft_masks:
+                ret.append(masks)
+            return ret
 
         # run nnet inference on chunks, averaging results
-        masks = np.zeros((*image.shape[:2], 3), np.float32)
-        counts = np.zeros((*image.shape[:2], 1), np.uint8)
+        masks = np.zeros((*image.shape[:2], prediction_count), np.float32)
+        counts = np.zeros((*image.shape[:2], prediction_count), np.float32)
         iterations = 0
-        for x in range(0, image.shape[1], chunk_size - overlap):
-            for y in range(0, image.shape[0], chunk_size - overlap):
+        step = chunk_size - overlap
+        for x in range(0, image.shape[1] - step, step):
+            for y in range(0, image.shape[0] - step, step):
                 if progress_callback is not None:
                     progress_current = y + x * image.shape[0]
                     progress_total = image.shape[0] * image.shape[1]
@@ -98,8 +103,8 @@ class NNetDetector(Detector):
                 right = min(x + chunk_size, image.shape[1])
                 top = y
                 bottom = min(y + chunk_size, image.shape[0])
-                left = min(left, right - chunk_size)
-                top = min(top, bottom - chunk_size)
+                left = right - chunk_size
+                top = bottom - chunk_size
 
                 chunk = image[top:bottom, left:right, :3]
                 chunk_outputs = self.model.predict(chunk)
@@ -119,28 +124,36 @@ class NNetDetector(Detector):
         if return_confidence_masks:
             confidences = confidences.astype(np.uint8)
         else:
-            confidences = None
+            del confidences
 
         # convert masks
-        masks = masks > self.model.thresholds
-        masks = masks.astype(np.uint8)
+        hard_masks = masks > self.model.thresholds
+        hard_masks = hard_masks.astype(np.uint8)
+        if return_soft_masks:
+            soft_masks = np.clip(masks, 0, 1) * 255
+            soft_masks = soft_masks.astype(np.uint8)
+        del masks
+
+        # maps post-processing
+        hard_masks[..., 0] = ndimage.binary_fill_holes(hard_masks[..., 0])
+        hard_masks[..., 0] = hard_masks[..., 0].astype(np.uint8)
+        hard_masks[..., 0] = remove_thin_structures(hard_masks[..., 0])
 
         min_map_ratio = 20
         min_water_ratio = 200
         min_wetmeadow_ratio = 200
-
-        # maps post-processing
-        masks[..., 0] = ndimage.binary_fill_holes(masks[..., 0])
-        masks[..., 0] = masks[..., 0].astype(np.uint8)
-        masks[..., 0] = remove_thin_structures(masks[..., 0])
+        min_drymeadow_ratio = 200
 
         # find map segments
         segments = [
-            list(self.find_segments(masks[..., n], min_area_ratio))
-            for n, min_area_ratio in enumerate([min_map_ratio, min_water_ratio, min_wetmeadow_ratio])
+            list(self.find_segments(hard_masks[..., n], min_area_ratio))
+            for n, min_area_ratio in enumerate([min_map_ratio, min_water_ratio, min_wetmeadow_ratio, min_drymeadow_ratio])
         ]
 
+        # return array
+        ret = [segments, hard_masks, confidence_values]
         if return_confidence_masks:
-            return segments, masks, confidence_values, confidences
-        else:
-            return segments, masks, confidence_values
+            ret.append(confidences)
+        if return_soft_masks:
+            ret.append(soft_masks)
+        return ret
