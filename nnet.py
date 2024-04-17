@@ -2,12 +2,94 @@
 import os
 import random
 import json
+import functools
+import io
+import pickle
+import sqlite3
 
 import cv2
 import numpy as np
 import tensorflow as tf
 from tensorflow.keras import layers
 from PIL import Image, ImageEnhance, ImageOps
+
+
+class Cache():
+
+    def __init__(self, path):
+        self.connection = sqlite3.connect(path, isolation_level=None)
+        self.connection.execute('PRAGMA journal_mode = WAL')
+        self.connection.execute('CREATE TABLE IF NOT EXISTS dict (key BLOB NOT NULL, value BLOB NOT NULL)')
+        self.connection.execute('CREATE UNIQUE INDEX IF NOT EXISTS key_index ON dict (key)')
+        self.connection.commit()
+
+
+    def __len__(self):
+        return self.connection.execute('SELECT COUNT(*) FROM dict').fetchone()[0]
+
+
+    def __contains__(self, key):
+        return self.connection.execute('SELECT value FROM dict WHERE key = ?', (pickle.dumps(key),)).fetchone() is not None
+
+
+    def __getitem__(self, key):
+        item = self.connection.execute('SELECT value FROM dict WHERE key = ?', (pickle.dumps(key),)).fetchone()
+        if item is None:
+            raise KeyError(key)
+        return pickle.loads(item[0])
+
+
+    def get(self, key, default=None):
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+
+    def __setitem__(self, key, value):
+        self.connection.execute('REPLACE INTO dict (key, value) VALUES (?,?)', (pickle.dumps(key), pickle.dumps(value)))
+        self.connection.commit()
+
+
+    def __delitem__(self, key):
+        if key not in self:
+            raise KeyError(key)
+        self.connection.execute('DELETE FROM dict WHERE key = ?', (pickle.dumps(key),))
+        self.connection.commit()
+
+
+    def close(self):
+        if self.connection is not None:
+            self.connection.close()
+            self.connection = None
+
+
+    def __enter__(self, *args, **kwargs):
+        return self
+
+
+    def __exit__(self, *args, **kwargs):
+        self.close()
+
+
+    def __del__(self):
+        self.close()
+
+
+def fnv1a(data):
+    """
+    Alternative FNV hash algorithm used in FNV-1a.
+    """
+    assert isinstance(data, bytes)
+
+    hval = 0xcbf29ce484222325
+    fnv_size = 2 ** 64
+    for byte in data:
+        hval = hval ^ byte
+        hval = (hval * 0x100000001b3) % fnv_size
+
+    return hval
+
 
 
 def lr_schedule(max_lr, min_lr, batch, epoch_batch_count, training_batch_count):
@@ -90,7 +172,7 @@ def mask_edges(masks):
     return tf.cast(gradient > 0.03, tf.float32)
 
 
-def boosted_edges_loss(targets, predictions):
+def boosted_edges_loss(targets, predictions, progress):
     """
     Computes loss with boosted mask edges
     """
@@ -103,7 +185,8 @@ def boosted_edges_loss(targets, predictions):
     weights = weights / tf.reduce_sum(weights, axis=(1, 2), keepdims=True)
 
     # l2 loss
-    loss = tf.where(targets == 1, tf.maximum(0.0,  1 - predictions) ** 2, tf.maximum(0.0, predictions) ** 2)
+    predictions = tf.clip_by_value(predictions, 0, 1)
+    loss = tf.abs(targets - predictions) ** 2#(2 + 2 * progress)
     loss = tf.reduce_sum(weights * loss, axis=(1, 2))
 
     return loss
@@ -143,13 +226,22 @@ class SegmentationLoss(tf.keras.layers.Layer):
     def __init__(self, logvars_init=None):
         super().__init__()
         self.logvars_init = logvars_init
+        self.training_progress = None
 
 
     def build(self, input_shapes):
         """
         Create variables
         """
-        self.logvars = self.add_weight(shape=(1, input_shapes[-1]), initializer=tf.constant_initializer(value=self.logvars_init), name='logvars', trainable=True)
+        # logvars
+        if self.logvars_init is None:
+            self.logvars = self.add_weight(shape=(1, input_shapes[-1]), initializer=tf.constant_initializer(value=0), name='logvars', trainable=False)
+        else:
+            self.logvars = self.add_weight(shape=(1, input_shapes[-1]), initializer=tf.constant_initializer(value=self.logvars_init), name='logvars', trainable=True)
+
+        # training progress
+        self.training_progress = self.add_weight(shape=(), initializer=tf.constant_initializer(value=0), name='training_progress', trainable=False)
+
 
 
     def call(self, in_masks, in_targets, p_targets):
@@ -159,8 +251,11 @@ class SegmentationLoss(tf.keras.layers.Layer):
         mask_types = self.logvars.shape[-1]
 
         # losses
-        raw_losses = boosted_edges_loss(in_targets, p_targets)
-        losses = tf.math.exp(-self.logvars) * raw_losses + self.logvars
+        raw_losses = boosted_edges_loss(in_targets, p_targets, self.training_progress)
+        if self.logvars_init is None:
+            losses = raw_losses
+        else:
+            losses = tf.math.exp(-self.logvars) * raw_losses + self.logvars
         losses = tf.reduce_mean(in_masks * losses, axis=1)
 
         # losses
@@ -170,8 +265,6 @@ class SegmentationLoss(tf.keras.layers.Layer):
         noise = (tf.math.exp(self.logvars) ** 0.5)
         for n in range(mask_types):
             self.add_metric(noise[0, n], name=f'n{n}')
-        for n in range(mask_types):
-            self.add_metric(1 - raw_losses[0, n], name=f'j{n}')
 
         return p_targets
 
@@ -286,6 +379,7 @@ def fast_model_parameters():
         'filters': [24, 32, 64, 64, 128, 256],
         'depth': 6,  # model trunk layers count
         'resolution': 3,  # scaling factor of model trunk (2 ** resolution)
+        'target_count': 4,
     }
 
 
@@ -295,9 +389,10 @@ def strong_model_parameters():
     """
     return {
         'img_size': (512, 512),
-        'filters': [24, 32, 64, 128, 226, 512],
+        'filters': [24, 32, 64, 128, 256, 512],
         'depth': 10,  # model trunk layers count
         'resolution': 2,  # scaling factor of model trunk (2 ** resolution)
+        'target_count': 4,
     }
 
 
@@ -334,7 +429,6 @@ class EncoderNN:
 
         # downscale features
         x = scales * [None]
-        size = in_image.shape[1]
         x[0] = in_image
         for n in range(1, scales):
             size = in_image.shape[1] // (2 ** n)
@@ -363,102 +457,6 @@ class EncoderNN:
         return self.model
 
 
-class UnsupervisedNN:
-    """
-    Unsupervised NN, reconstruction
-    """
-    def __init__(self, path=None, parameters=None):
-        """
-        Initialize net
-        """
-        self.model = None
-        self.training_model = None
-
-        # create / load model
-        if path is None:
-            self.build_training(EncoderNN(parameters=parameters))
-        else:
-            self.load(path)
-
-
-    def build_model(self, encoder, in_img):
-        """
-        Build detector
-        """
-        # add detection head
-        scales = encoder.scales
-        filters = encoder.filters
-        embedding =  encoder.model(in_img)[0]
-        reconstruction = msf_block(embedding, [3] + filters[0:scales - 1], 'up')[0]
-
-        return tf.keras.Model(
-            name='unsupervised_model',
-            inputs=[in_img],
-            outputs=[reconstruction],
-        )
-
-
-    def build_training(self, encoder):
-        """
-        Build training models
-        """
-        # inputs
-        in_blended = layers.Input(shape=encoder.img_size + (3,), dtype=tf.float32, name='combined_image')
-        in_a = layers.Input(shape=encoder.img_size + (3,), dtype=tf.float32, name='a_image')
-        in_b = layers.Input(shape=encoder.img_size + (3,), dtype=tf.float32, name='b_image')
-
-        # models
-        self.model = self.build_model(encoder, in_blended)
-
-        # outputs
-        p_reconstruction = self.model(in_blended)
-
-        # losses
-        p_unsupervised = BlendedLoss()(in_blended, in_a, in_b, p_reconstruction)
-
-        # model for training
-        self.training_model = tf.keras.Model(
-            name='training_model',
-            inputs=[in_blended, in_a, in_b],
-            outputs=[p_unsupervised],
-        )
-
-        # unsupervised optimizer
-        self.training_model.compile(optimizer=tf.keras.optimizers.Adam(0.001))
-
-
-    def predict(self, inputs):
-        """
-        Predict outputs
-        """
-        return self.model.predict_on_batch(inputs)
-
-
-    def eval(self, inputs, outputs):
-        """
-        Evaluate inputs
-        """
-        return self.training_model.test_on_batch(inputs, outputs)
-
-
-    def save(self, path):
-        """
-        Save model to file
-        """
-        self.training_model.save(path, save_format='tf')
-
-
-    def load(self, path):
-        """
-        Load model from saved file
-        """
-        self.training_model = tf.keras.models.load_model(
-            path,
-            custom_objects={'BlendedLoss': BlendedLoss},
-        )
-        self.model = self.training_model.get_layer('unsupervised_model')
-
-
 class DetectorNN:
     """
     Detector NN, semantic segmentation
@@ -467,7 +465,7 @@ class DetectorNN:
         """
         Initialize net
         """
-        self.target_count = 4  # map, water, wet meadow, dry meadow
+        self.target_count = parameters['target_count']
 
         self.model = None
         self.training_model = None
@@ -480,8 +478,6 @@ class DetectorNN:
             model_type, path = load
             if model_type == 'detector':
                 self.load(path)
-            elif model_type == 'unsupervised':
-                self.load_unsupervised(path)
             else:
                 assert False
 
@@ -508,8 +504,6 @@ class DetectorNN:
         """
         Create training models
         """
-        assert self.logvars_init is not None
-
         # inputs
         in_img = layers.Input(shape=encoder.img_size + (3,), dtype=tf.float32, name='image')
         in_targets = layers.Input(shape=encoder.img_size + (self.target_count,), dtype=tf.float32, name='targets')
@@ -570,19 +564,6 @@ class DetectorNN:
         self.model = self.training_model.get_layer('detector')
 
 
-    def load_unsupervised(self, path):
-        """
-        Load from unsupervised model file
-        """
-        training_model = tf.keras.models.load_model(
-            path,
-            custom_objects={'BlendedLoss': BlendedLoss},
-        )
-        unsupervised_model = training_model.get_layer('unsupervised_model')
-        encoder = EncoderNN(unsupervised_model.get_layer('encoder'))
-        self.build_training(encoder)
-
-
 def create_blobs(width, height, fill=0.5, seed=None):
     """
     Create blob mask
@@ -628,7 +609,7 @@ class RandAug:
         self.transforms = {
             'identity': [1, RandAug.augment_identity, None],
             #'invert': [1, RandAug.augment_invert, None],
-            'contrast': [0.8, RandAug.augment_contrast, None],
+            'contrast': [0.2, RandAug.augment_contrast, None],
             'brightness': [0.1, RandAug.augment_brightness, None],
             'sharpness': [0.9, RandAug.augment_sharpness, None],
             #'affine': [1, RandAug.augment_affine, None],
@@ -675,7 +656,7 @@ class RandAug:
             return None, image
         else:
             if contrast is None:
-                contrast = 1 + 2 * magnitude * random.random()
+                contrast = 1 + magnitude * random.random()
                 if random.random() < 0.5:
                     contrast = 1 / contrast
 
@@ -702,7 +683,7 @@ class RandAug:
             return None, image
         else:
             if brightness is None:
-                brightness = magnitude * (2 * random.random() - 1)
+                brightness = magnitude * (random.random() - 0.5)
 
             hsv = cv2.cvtColor(image, cv2.COLOR_RGB2HSV)
             h, s, v = cv2.split(hsv)
@@ -850,7 +831,7 @@ def dataset_info(dataset_path, types):
         filtered_types = set(samples.keys()) & types
         if not filtered_types:
             continue
-        filtered_samples.append({types: os.path.join(dataset_path, samples[types][0]) for types in filtered_types})
+        filtered_samples.append({types: os.path.join(dataset_path, samples[types]) for types in filtered_types})
         for current_type in filtered_types:
             filtered_counts[current_type] = filtered_counts.get(current_type, 0) + 1
 
@@ -891,79 +872,35 @@ def blend_images(batch_images):
     return batch_blended, batch_a, batch_b
 
 
-def iterate_unsupervised(dataset_path, batch_size, shuffle=True, augment=True):
-    """
-    Itearate through the whole unsupervised dataset
-    """
-    # read dataset
-    info = dataset_info(dataset_path, {'image'})
-    samples = info['samples']
-
-    batch_images = []
-    while True:
-        if shuffle:
-            random.shuffle(samples)
-        for paths in samples:
-            image_file = paths['image']
-
-            # read image
-            image = Image.open(image_file)
-            assert image.mode == 'RGB'
-            image = np.asarray(image)
-            width, height = image.shape[:2]
-
-            # augment
-            if augment:
-                randaug = RandAug(2)
-                image = randaug.augment('image', image)
-
-            batch_images.append(image)
-
-            # yield batch
-            if len(batch_images) ==  batch_size:
-                batch_blended, batch_a, batch_b = blend_images(batch_images)
-                zeros = np.zeros((batch_size,))
-                yield [
-                    np.asarray(batch_blended),
-                    np.asarray(batch_a),
-                    np.asarray(batch_b),
-                ], [zeros]
-                batch_images = []
-
-        # yield the restbatch
-        if batch_images:
-            batch_blended, batch_a, batch_b = blend_images(batch_images)
-            zeros = np.zeros((batch_size,))
-            yield [
-                np.asarray(batch_blended),
-                np.asarray(batch_a),
-                np.asarray(batch_b),
-            ], [zeros]
-            batch_images = []
-
-
-def iterate_supervised(dataset_path, batch_size, masks, shuffle=True, augment=True):
+def iterate_supervised(dataset_path, start_epoch, batch_size, target_names, shuffle=True, augment=True, return_paths=False):
     """
     Itearate through the whole supervised dataset
     """
-    assert masks is not None
+    assert target_names is not None
 
     # read dataset info
-    info = dataset_info(dataset_path, set(masks) | {'image'})
+    info = dataset_info(dataset_path, set(target_names) | {'image'})
     samples = info['samples']
 
     # iterate through dataset
     batch_images = []
     batch_masks = []
     batch_targets = []
+    batch_paths = []
+    epoch = start_epoch
     while True:
+        # seed random generator
+        np.random.seed(epoch)
+        random.seed(epoch)
+
+        # shuffle
         if shuffle:
             random.shuffle(samples)
-        for paths in samples:
-            image_file = paths['image']
 
+        for paths in samples:
             # read images
-            image = Image.open(image_file)
+            image_path = paths['image']
+            image = Image.open(image_path)
             assert image.mode == 'RGB'
             image = np.asarray(image)
             width, height = image.shape[:2]
@@ -975,61 +912,74 @@ def iterate_supervised(dataset_path, batch_size, masks, shuffle=True, augment=Tr
 
             # read masks
             masks = []
-            mask_targets = []
+            targets = []
+            target_paths = []
             contains_map = True
-            for mask in ['map', 'water', 'wetmeadow', 'drymeadow']:  # map must be first (contais_map)
-                mask_file = paths.get(mask)
-                if mask_file is None:
+            assert target_names[0] == 'map'  # for contains_map
+            for mask in target_names:
+                target_path = paths.get(mask)
+                if target_path is None:
                     if contains_map:
                         masks.append(0)
                     else:
                         masks.append(1)  # no map == no other regions
-                    mask_target = np.zeros((width, height), np.float32)
+                    target = np.zeros((width, height), np.float32)
+                    target_paths.append(None)
                 else:
                     masks.append(1)
-                    mask_target = Image.open(mask_file)
-                    assert mask_target.mode == 'L'
-                    mask_target = np.asarray(mask_target)
-                assert mask_target.shape == (width, height)
+                    target = Image.open(target_path)
+                    assert target.mode == 'L'
+                    target = np.asarray(target)
+                    target_paths.append(target_path)
+                assert target.shape == (width, height)
 
                 # augment
                 if augment:
-                    if mask_file is not None:
-                        mask_target = randaug.augment('mask', mask_target)
-                        mask_target = mask_target.astype(np.float32) / 255
+                    if target_path is not None:
+                        target = randaug.augment('mask', target)
+                        target = target.astype(np.float32) / 255
                 else:
-                    if mask_file is not None:
-                        mask_target = mask_target.astype(np.float32) / 255
+                    if target_path is not None:
+                        target = target.astype(np.float32) / 255
 
                 # if there is no map region, other masks are not present as well
-                if mask == 'map' and mask_file is not None and np.sum(mask_target) == 0:
+                if mask == 'map' and target_path is not None and np.sum(target) == 0:
                     contains_map = False
 
-                mask_targets.append(mask_target[..., None])
+                targets.append(target[..., None])
 
             # add to batch
             batch_images.append(image.astype(np.float32))
             batch_masks.append(np.asarray(masks, dtype=np.float32))
-            batch_targets.append(np.concatenate(mask_targets, axis=-1))
+            batch_targets.append(np.concatenate(targets, axis=-1))
+            batch_paths.append((image_path, tuple(target_paths)))
 
             # yield batch
             if len(batch_images) == batch_size:
-                yield {
+                batch = {
                     'image': np.asarray(batch_images),
                     'masks': np.asarray(batch_masks),
                     'targets': np.asarray(batch_targets),
                 }
+                if return_paths:
+                    batch['paths'] = batch_paths
+                yield batch
                 batch_images = []
                 batch_masks = []
                 batch_targets = []
 
         # yield the rest batch
         if batch_images:
-            yield {
+            batch = {
                 'image': np.asarray(batch_images),
                 'masks': np.asarray(batch_masks),
                 'targets': np.asarray(batch_targets),
             }
+            if return_paths:
+                batch['paths'] = batch_paths
+            yield batch
             batch_images = []
             batch_masks = []
             batch_targets = []
+
+        epoch += 1
