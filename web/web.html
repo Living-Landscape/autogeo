@@ -14,6 +14,9 @@
 		aside {color:gray;margin:2em 1em 1em 1em;}
 		th {padding: 0.1em 1em;text-align:right;font-family:sans-serif;color:#07c;text-overflow:ellipsis;overflow:hidden;max-width:20em;width:50%;white-space:nowrap;}
 		td {padding: 0.1em 1em;text-align:left;text-overflow:ellipsis;overflow:hidden;white-space:nowrap;}
+		ul {color:gray;max-width: 50em;margin: 0 auto;}
+		li {text-align:left;}
+		code {background:#eee;padding:0.1em 0.1em;border-radius:0.2em;}
 		#upload {opacity:0;position: absolute;z-index:-1;}
 		#message {color:red;margin: 1em;}
 		#nojs {color:red;padding: 1em 0;}
@@ -31,7 +34,13 @@
 	<article>
 	<h1>Císařské otisky</h1>
 	<p><img alt="" width=759 height=272 src="app/preview.jpg"></p>
-	<p>Po vložení obrázků císařských otisků se ti vrátí ořízlé obrázky map, vodstva, mokrých  a suchých luk.</p>
+	<p>
+		Po vložení obrázků císařských otisků se ti vrátí ořízlé obrázky map, vodstva, mokrých  a suchých luk.
+		<ul>
+			<li>můžeš použít <code>png</code> nebo <code>jpg</code> obrázky včetně georeferencovaných <code>pgw</code> a <code>jgw</code> souborů (obrázky a <code>pgw</code>, <code>jgw</code> nahrávej současně)
+				<li>po ořezání se ti vrátí <code>zip</code> s vyřezanými částmi map a v případě georeferencovaných souborů i vektorové vrstvy
+		</ul>
+	</p>
 	<div id=workspace-wrap><table id=workspace></table></div>
 	<form url=upload method=post enctype=multipart/form-data>
 		<label for=upload>Nahraj mapu</label>
