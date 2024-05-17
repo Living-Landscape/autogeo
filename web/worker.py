@@ -190,7 +190,7 @@ def process(job_id, detector_type, output_format):
         wetmeadow_index = 2
         drymeadow_index = 3
         names = ['mapa', 'voda', 'mokre_louky', 'suche_louky']
-        prediction_progress = 0.75
+        prediction_progress = 0.5
         output_progress = 1 - prediction_progress
 
         if detector_type == 'nnet':
