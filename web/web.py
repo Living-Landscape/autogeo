@@ -14,6 +14,8 @@ import logging
 from functools import wraps
 import time
 from datetime import datetime, timedelta
+import tarfile
+import math
 
 from flask import Flask, send_from_directory, request, make_response
 from werkzeug.utils import secure_filename
@@ -77,7 +79,7 @@ def log_request(fn):
     return wrap
 
 
-@app.route('/icon.png')
+@app.route('/app/icon.png')
 def image_icon():
     response = make_response(send_from_directory('.', 'web_icon.png'))
     response.headers['cache-control'] = 'public'
@@ -85,9 +87,17 @@ def image_icon():
     return response
 
 
-@app.route('/preview.jpg')
+@app.route('/app/preview.jpg')
 def image_preview():
     response = make_response(send_from_directory('.', 'web_preview.jpg'))
+    response.headers['cache-control'] = 'public'
+    response.headers['expires'] = (datetime.utcnow() + timedelta(30)).strftime("%a, %d %b %Y %H:%M:%S GMT")
+    return response
+
+
+@app.route('/app/script.js')
+def javascript():
+    response = make_response(send_from_directory('.', 'web_script.js'))
     response.headers['cache-control'] = 'public'
     response.headers['expires'] = (datetime.utcnow() + timedelta(30)).strftime("%a, %d %b %Y %H:%M:%S GMT")
     return response
@@ -221,6 +231,11 @@ def upload():
     Return main page
     """
     try:
+        # check queue size
+        max_queue_size = 100
+        if len(queue) > max_queue_size:
+            return {'error': 'Server nyní zpracovává mnoho požadavků, počkejte chvíli a pak to zkuste znovu.'}, 422
+
         # parse uploaded file
         if 'upload' not in request.files:
             return {'error': 'Chybí nahrávaný soubor.'}, 422
@@ -229,23 +244,56 @@ def upload():
         if file.filename == '':
             return {'error': 'Nahrávanému souboru chybí jméno.'}, 422
 
-        # check queue size
-        max_queue_size = 100
-        if len(queue) > max_queue_size:
-            return {'error': 'Server nyní zpracovává mnoho požadavků, počkejte chvíli a pak to zkuste znovu.'}, 422
-
         max_file_size = 20 * 1024 ** 2
         source_name = secure_filename(file.filename)
         name = os.path.splitext(source_name)[0]
-        image_bytes = file.stream.read(max_file_size + 1)
-        if len(image_bytes) == max_file_size + 1:
+        file_bytes = file.stream.read(max_file_size + 1)
+        if len(file_bytes) == max_file_size + 1:
             return {'error': f'Maximální velikost souboru je {max_file_size // 1024 ** 2}MB.'}, 422
+        file_bytes_io = io.BytesIO(file_bytes)
+
+        # try to open tar
+        try:
+            with tarfile.open(fileobj=file_bytes_io) as tar_file:
+                members = tar_file.getmembers()
+                if len(members) != 2 or not all(member.isfile() for member in members):
+                    return {'error': 'Očekávám pouze obrázek a případně odpovídající world file pro georeferencovaný ořez'}, 422
+                if members[0].name.endswith('pgw') or members[0].name.endswith('jgw'):
+                    world_member = members[0]
+                    image_member = members[1]
+                elif members[1].name.endswith('pgw') or members[1].name.endswith('jgw'):
+                    world_member = members[1]
+                    image_member = members[0]
+                else:
+                    return {'error': 'Očekávám pouze obrázek a případně odpovídající world file pro georeferencovaný ořez'}, 422
+
+                # parse word file
+                world_lines = tar_file.extractfile(world_member).read().decode('utf8').split('\n')
+                if len(world_lines) != 6:
+                    return {'error': 'World file by mělo obsahovat pouze 6 řádek, na každém řádku číslo (parametr affiní transformace)'}, 422
+                try:
+                    world_params = list(map(float, world_lines))
+                    if not all(math.isfinite(number) for number in world_params):
+                        raise ValueError
+                except ValueError:
+                    return {'error': 'World file by mělo obsahovat pouze 6 řádek, na každém řádku číslo (parametr affiní transformace)'}, 422
+
+                # extract image
+                image_bytes_io = io.BytesIO(tar_file.extractfile(image_member).read())
+
+                logger.info(world_params)
+                logger.info(image_bytes_io)
+                name = os.path.splitext(name)[0]
+        except tarfile.ReadError:
+            # likely an image
+            world_params = None
+            image_bytes_io = file_bytes_io
 
         # check dimensions
         max_dimension = 10000
         min_dimension = 100
         try:
-            width, height = imagesize.get(io.BytesIO(image_bytes))
+            width, height = imagesize.get(image_bytes_io)
             logger.info('%s image size %sx%s', request.id, width, height)
         except ValueError:
             return {'error': 'Nedokážu přečíst nahrávaný soubor, zpracuju jenom .png a .jpg obrázky.'}, 422
@@ -265,18 +313,19 @@ def upload():
 
         # save image to temporary store
         with open(os.path.join('jobs', job_id), 'wb') as job_file:
-            job_file.write(image_bytes)
+            job_file.write(image_bytes_io.getvalue())
 
         # enqueue job
         queue.enqueue(
             worker.process,
-            args=(job_id, 'nnet', 'multi'),
+            args=(job_id, 'nnet', 'png'),
             job_id=job_id,
             job_timeout=1800,
             result_ttl=1800,
             failure_ttl=1800,
             meta={
                 'name': name,
+                'world_params': world_params,
             },
         )
         logger.info('%s %s job enqueued', request.id, job_id)

@@ -8,6 +8,7 @@ import gc
 import logging
 import subprocess
 import time
+import json
 
 from redis import Redis
 from rq.job import Job
@@ -40,12 +41,10 @@ def save_image(image, name, output_format, zip_file):
             image = Image.fromarray(image)
             image.save(image_bytes, format='png')
 
-            # optimize output image - quantize + compress
+            # optimize output image - quantize
             try:
-                process = subprocess.Popen(['pngquant', '-'], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+                process = subprocess.Popen(['pngquant', '--quality', '50', '--nofs', '-'], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
                 compressed_bytes = process.communicate(input=image_bytes.getvalue())[0]
-                process = subprocess.Popen(['oxipng', '--strip', 'safe', '-'], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
-                compressed_bytes = process.communicate(input=compressed_bytes)[0]
                 if len(compressed_bytes) == 0:
                     compressed_bytes = image_bytes.getvalue()
             except Exception:
@@ -57,28 +56,72 @@ def save_image(image, name, output_format, zip_file):
             image = Image.fromarray(image)
             image.save(image_bytes, format='webp')
             zip_file.writestr(f'{name}.webp', image_bytes.getvalue())
-    elif output_format == 'jpg':
-        image = Image.fromarray(image)
-        masked_image = Image.new('RGBA', image.size, 'white')
-        masked_image.paste(image, (0, 0), image)
-        masked_image = masked_image.convert('RGB')
-        with io.BytesIO() as image_bytes:
-            masked_image.save(image_bytes, format='jpeg', quality=90, optimize=True)
-            zip_file.writestr(f'{name}.jpg', image_bytes.getvalue())
-    elif output_format == 'multi':
-        # webp
-        with io.BytesIO() as image_bytes:
-            image = Image.fromarray(image)
-            image.save(image_bytes, format='webp')
-            zip_file.writestr(f'{name}.webp', image_bytes.getvalue())
 
-        # jpg
-        masked_image = Image.new('RGBA', image.size, 'white')
-        masked_image.paste(image, (0, 0), image)
-        masked_image = masked_image.convert('RGB')
-        with io.BytesIO() as image_bytes:
-            masked_image.save(image_bytes, format='jpeg', quality=90, optimize=True)
-            zip_file.writestr(f'jpg/{name}.jpg', image_bytes.getvalue())
+
+def save_vectors(map_segment, contours, resize_ratio, name, output_format, job, zip_file):
+    """
+    Save vector data
+    """
+    if job.meta['world_params'] is None or output_format != 'png':
+        return
+
+    # transform
+    if job.meta['world_params']:
+        map_box, map_contour = map_segment
+        translation = [
+            map_box[0] * resize_ratio,
+            map_box[1] * resize_ratio,
+        ]
+
+        params = job.meta['world_params']
+        affine_matrix = np.asarray([
+            [params[0], params[2], params[4]],
+            [params[1], params[3], params[5]],
+            [0, 0, 1],
+        ])
+        transformed_params = affine_matrix @ np.asarray([[1, 0, translation[0]], [0, 1, translation[1]], [0, 0, 1]])
+        transformed_params = transformed_params.tolist()
+        transformed_params = [
+            transformed_params[0][0],
+            transformed_params[1][0],
+            transformed_params[0][1],
+            transformed_params[1][1],
+            transformed_params[0][2],
+            transformed_params[1][2],
+        ]
+    else:
+        transformed_params = None
+
+    # write world file
+    if job.meta['world_params'] is not None and output_format == 'png':
+        world_file_bytes = '\n'.join(map(str, transformed_params)).encode('utf8')
+        zip_file.writestr(f'{name}.pgw', world_file_bytes)
+
+    # write vectorized mask
+    if job.meta['world_params']:
+        # transform mask contours
+        polygons = []
+        for contour in contours:
+            ones = np.ones((contour.shape[0], 1, 1))
+            coordinates = np.concatenate([contour * resize_ratio, ones], axis=2)[:, 0, :]
+            transformed_coordinates = ((affine_matrix @ coordinates.T).T)[:, 0:2]
+            transformed_coordinates = transformed_coordinates.tolist()
+            transformed_coordinates += transformed_coordinates[:1]  # the last coordinate have to be the same as the first one
+            polygons.append([transformed_coordinates])
+
+        # write geojson file
+        geojson = json.dumps({
+            'type': 'FeatureCollection',
+            'features': [{
+                'type': 'Feature',
+                'geometry': {
+                    'type': 'MultiPolygon',
+                    'coordinates': polygons,
+                },
+                'properties': {'prop0': 'first'}
+            }]
+        })
+        zip_file.writestr(f'{name}.geojson', geojson)
 
 
 def process(job_id, detector_type, output_format):
@@ -86,7 +129,7 @@ def process(job_id, detector_type, output_format):
     Extract map parts
     """
     assert detector_type in ('nnet', ), f'Unsupported detector type {detector_type}'
-    assert output_format in ('png', 'webp', 'jpg', 'multi'), f'Unsupported output format {output_format}'
+    assert output_format in ('png', 'webp'), f'Unsupported output format {output_format}'
 
     try:
         job_path = os.path.join('jobs', job_id)
@@ -170,7 +213,9 @@ def process(job_id, detector_type, output_format):
                     map_image = cv2.resize(map_image, (resize_ratio * map_width, resize_ratio * map_height), interpolation=cv2.INTER_CUBIC)
 
                 # write map image
-                save_image(map_image, f'{names[map_index]}_{n + 1}', output_format, zip_file)
+                image_name = f'{names[map_index]}_{n + 1}'
+                save_image(map_image, image_name, output_format, zip_file)
+                save_vectors(map_segment, [map_contour], resize_ratio, image_name, output_format, job, zip_file)
 
                 del map_image
                 gc.collect()
@@ -179,6 +224,7 @@ def process(job_id, detector_type, output_format):
                 for mask_index in [water_index, wetmeadow_index, drymeadow_index]:
                     # draw mask image
                     mask_image = None
+                    mask_contours = []
                     for p, mask_segment in enumerate(segments[mask_index]):
                         (left, top, right, bottom), contour = mask_segment
                         if (
@@ -186,6 +232,7 @@ def process(job_id, detector_type, output_format):
                             (map_top <= top < map_bottom or map_top <= bottom < map_bottom)
                         ):
                             mask_image = detector.draw_segment((map_box, contour), erase=mask_image is None)
+                            mask_contours.append(contour)
 
                     # write mask image
                     if mask_image is not None:
@@ -195,29 +242,12 @@ def process(job_id, detector_type, output_format):
                         )
                         if resize_ratio:
                             mask_image = cv2.resize(mask_image, (resize_ratio * map_width, resize_ratio * map_height), interpolation=cv2.INTER_CUBIC)
-                        save_image(mask_image, f'{names[mask_index]}_{n + 1}', output_format, zip_file)
+                        image_name = f'{names[mask_index]}_{n + 1}'
+                        save_image(mask_image, image_name, output_format, zip_file)
+                        save_vectors(map_segment, mask_contours, resize_ratio, image_name, output_format, job, zip_file)
 
                     del mask_image
                     gc.collect()
-
-            # background colors
-            if output_format == 'jpg':
-                background_colors = '\n'.join(
-                    f'{r} {g} {b} 100'
-                    for r in range(250, 256)
-                    for g in range(250, 256)
-                    for b in range(250, 256)
-                )
-                zip_file.writestr('pozadi.txt', background_colors)
-            elif output_format == 'multi':
-                background_colors = '\n'.join(
-                    f'{r} {g} {b} 100'
-                    for r in range(250, 256)
-                    for g in range(250, 256)
-                    for b in range(250, 256)
-                )
-                zip_file.writestr('jpg/pozadi.txt', background_colors)
-
         del detector
         del image
         gc.collect()
