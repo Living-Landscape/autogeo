@@ -118,7 +118,7 @@ def save_vectors(map_segment, contours, resize_ratio, name, output_format, job, 
                     'type': 'MultiPolygon',
                     'coordinates': polygons,
                 },
-                'properties': {'prop0': 'first'}
+                'properties': {}
             }]
         })
         zip_file.writestr(f'{name}.geojson', geojson)
@@ -180,7 +180,7 @@ def process(job_id, detector_type, output_format):
 
             now = time.time()
             if last_progress_update is None or now - last_progress_update > update_delay:
-                job.meta['progress'] = progress * 0.95  # adjustment for zipping files
+                job.meta['progress'] = progress
                 job.save()
                 last_progress_update = now
 
@@ -190,18 +190,25 @@ def process(job_id, detector_type, output_format):
         wetmeadow_index = 2
         drymeadow_index = 3
         names = ['mapa', 'voda', 'mokre_louky', 'suche_louky']
+        prediction_progress = 0.75
+        output_progress = 1 - prediction_progress
 
         if detector_type == 'nnet':
             detector = NNetDetector('model_nnet.tflite', image)
             last_progress_update = None
-            segments, masks, confidence = detector.detect(progress_fn)
+            segments, masks, confidence = detector.detect(lambda progress: progress_fn(prediction_progress * progress))
             masks = 255 * masks
+            progress_fn(prediction_progress)
         if not segments[map_index]:  # map mask
+            progress_fn(1)
             raise NoMapsFound('Nepodařilo se najít žádné mapy na obrázku.')
 
         # zip with images
         with zipfile.ZipFile(result_path, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+            segment_count = len(segments[map_index])
             for n, map_segment in enumerate(segments[map_index]):
+                progress_fn(prediction_progress + n / segment_count * output_progress)
+
                 map_box, map_contour = map_segment
                 map_left, map_top, map_right, map_bottom = map_box
                 map_width = map_right - map_left + 1
@@ -222,6 +229,8 @@ def process(job_id, detector_type, output_format):
 
                 # find all target chunks inside current map segment
                 for mask_index in [water_index, wetmeadow_index, drymeadow_index]:
+                    progress_fn(prediction_progress + (n + mask_index / len(names)) / segment_count * output_progress)
+
                     # draw mask image
                     mask_image = None
                     mask_contours = []
@@ -248,6 +257,8 @@ def process(job_id, detector_type, output_format):
 
                     del mask_image
                     gc.collect()
+
+        progress_fn(1)
         del detector
         del image
         gc.collect()

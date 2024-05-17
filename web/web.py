@@ -281,8 +281,7 @@ def upload():
                 # extract image
                 image_bytes_io = io.BytesIO(tar_file.extractfile(image_member).read())
 
-                logger.info(world_params)
-                logger.info(image_bytes_io)
+                # strip tar extension
                 name = os.path.splitext(name)[0]
         except tarfile.ReadError:
             # likely an image
