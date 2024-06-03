@@ -268,7 +268,7 @@ def upload():
                     return {'error': 'Očekávám pouze obrázek a případně odpovídající world file pro georeferencovaný ořez'}, 422
 
                 # parse word file
-                world_lines = tar_file.extractfile(world_member).read().decode('utf8').split('\n')
+                world_lines = tar_file.extractfile(world_member).read().decode('utf8').strip().split('\n')
                 if len(world_lines) != 6:
                     return {'error': 'World file by mělo obsahovat pouze 6 řádek, na každém řádku číslo (parametr affiní transformace)'}, 422
                 try:

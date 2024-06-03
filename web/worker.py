@@ -65,6 +65,9 @@ def save_vectors(map_segment, contours, resize_ratio, name, output_format, job, 
     if job.meta['world_params'] is None or output_format != 'png':
         return
 
+    if resize_ratio is None:
+        resize_ratio = 1
+
     # transform
     if job.meta['world_params']:
         map_box, map_contour = map_segment
@@ -111,6 +114,10 @@ def save_vectors(map_segment, contours, resize_ratio, name, output_format, job, 
 
         # write geojson file
         geojson = json.dumps({
+            'crs': {
+                'type': 'name',
+                'properties': { 'name': 'urn:ogc:def:crs:EPSG::5514' },
+            },
             'type': 'FeatureCollection',
             'features': [{
                 'type': 'Feature',
